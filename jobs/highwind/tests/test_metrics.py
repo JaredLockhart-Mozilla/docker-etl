@@ -119,13 +119,48 @@ def test_no_window_at_all_is_unsupported():
     assert "no window" in reason
 
 
-def test_a_non_repeating_window_is_unsupported():
-    # Highwind's window rules always repeat for the life of the experiment; a metric that declares
-    # a single window that stops has no equivalent rule.
-    rules, reason = metrics.window_rules(aggregation_metric(repeat_windows=False))
+@pytest.mark.parametrize("length", [7, 14, 28])
+def test_a_non_repeating_cumulative_window_becomes_a_single_window_rule(length):
+    rules, reason = metrics.window_rules(
+        aggregation_metric(cumulative_window=length, repeat_windows=False)
+    )
+
+    assert rules == ({"kind": "cumulative", "length": length, "repeat": False},)
+    assert reason is None
+
+
+def test_a_non_repeating_window_off_the_bucket_grid_is_reported():
+    rules, reason = metrics.window_rules(
+        aggregation_metric(cumulative_window=10, repeat_windows=False)
+    )
 
     assert rules is None
-    assert "repeat_windows" in reason
+    assert "cumulative_window" in reason
+
+
+def test_a_non_repeating_incremental_window_is_unsupported():
+    # There is no earlier window for a single incremental window to be relative to, which makes it
+    # indistinguishable from a cumulative window of the same length; Highwind declines rather than
+    # guessing which family it means.
+    rules, reason = metrics.window_rules(
+        aggregation_metric(cumulative_window=None, incremental_window=7, repeat_windows=False)
+    )
+
+    assert rules is None
+    assert "incremental_window" in reason
+
+
+def test_a_non_repeating_cumulative_window_resolves_even_beside_an_incremental_one():
+    # The incremental half has no Highwind equivalent on its own (see the test above), but a
+    # valid, resolvable cumulative_window on the same metric is not discarded just because
+    # incremental_window is also set: Highwind computes the cumulative half and leaves the
+    # incremental half uncomputed.
+    rules, reason = metrics.window_rules(
+        aggregation_metric(cumulative_window=14, incremental_window=7, repeat_windows=False)
+    )
+
+    assert rules == ({"kind": "cumulative", "length": 14, "repeat": False},)
+    assert reason is None
 
 
 def test_an_incremental_window_that_is_not_one_bucket_is_reported_not_raised():
@@ -170,12 +205,48 @@ def test_resolve_splits_missing_names_into_unresolved_with_a_reason():
 
 
 def test_resolve_reports_an_unsupported_window_the_same_way_as_a_missing_name():
-    plan = plan_of({"active_hours": aggregation_metric(repeat_windows=False)})
+    plan = plan_of(
+        {
+            "active_hours": aggregation_metric(
+                cumulative_window=None, incremental_window=7, repeat_windows=False
+            )
+        }
+    )
 
     resolved, unresolved = metrics.split_resolved_metrics(plan, FakeConfigs())
 
     assert resolved == {}
-    assert "repeat_windows" in unresolved["active_hours"]
+    assert "incremental_window" in unresolved["active_hours"]
+
+
+def test_resolve_builds_a_single_window_metric_from_a_non_repeating_plan_entry():
+    plan = plan_of(
+        {"active_hours": aggregation_metric(cumulative_window=7, repeat_windows=False)}
+    )
+
+    resolved, unresolved = metrics.split_resolved_metrics(plan, FakeConfigs())
+
+    assert unresolved == {}
+    assert resolved["active_hours"].window_rules == (
+        {"kind": "cumulative", "length": 7, "repeat": False},
+    )
+
+
+def test_resolve_builds_a_single_window_metric_even_with_an_incremental_window_set():
+    plan = plan_of(
+        {
+            "active_hours": aggregation_metric(
+                cumulative_window=14, incremental_window=7, repeat_windows=False
+            )
+        }
+    )
+
+    resolved, unresolved = metrics.split_resolved_metrics(plan, FakeConfigs())
+
+    assert unresolved == {}
+    assert resolved["active_hours"].window_rules == (
+        {"kind": "cumulative", "length": 14, "repeat": False},
+    )
 
 
 def test_resolve_builds_a_metric_from_a_resolvable_plan_entry():

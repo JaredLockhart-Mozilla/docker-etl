@@ -26,8 +26,9 @@ A proof of concept. What it does not cover is under [Proof-of-concept scope](#pr
    `forming`, `confident` or `error`. Cells that produced nothing are written too, so an experiment
    whose queries failed cannot report a clean error rate by writing no rows at all.
 
-Windows are anchored to each unit's own enrollment rather than to the calendar, so `cumu:2` covers a
-client's own first two weeks and cells are comparable across clients who enrolled on different days.
+Windows are anchored to each unit's own enrollment rather than to the calendar and named by the days
+they cover, so `14d` covers a client's own first 14 days and cells are comparable across clients who
+enrolled on different days.
 `analysis.py`'s `run_daily_job` is the entry point, and the module docstrings carry the reasoning for
 each step.
 

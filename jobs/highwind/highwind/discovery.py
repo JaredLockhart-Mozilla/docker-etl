@@ -304,6 +304,26 @@ class Window:
         return self.end - self.start + 1
 
 
+def window_label(kind, start, end):
+    """The label a window of `kind` covering tenure days `start` to `end` (both inclusive) carries.
+
+    Named by the days it covers rather than by its position in whichever rule produced it: a
+    cumulative window is `"{N}d"`, the first N days; a disjoint window is `"{start}-{end}d"`. Two
+    windows covering the same days always carry the same label, whichever rule generated them, which
+    is what lets a single non-repeating window and a repeating family's window of the same length
+    (e.g. a lone 28-day window and the fourth window of a repeating 7-day cumulative rule) collapse
+    onto one shared result instead of reporting under two different labels for the same days.
+
+    `sql_generation.unit_windows_cte` labels a bucket in SQL by calling `window_at` for that same
+    bucket position, rather than reimplementing this mapping, so the two sides cannot disagree.
+    """
+    if kind == "cumulative":
+        return f"{end + 1}d"
+    if kind == "disjoint":
+        return f"{start}-{end + 1}d"
+    raise ValueError(f"unknown window kind {kind!r}; expected disjoint or cumulative")
+
+
 def generate_windows(rule, tenure_days):
     """Concrete windows for one metric's window rule, stopping once a window would need more than
     `tenure_days` to complete.
@@ -311,7 +331,8 @@ def generate_windows(rule, tenure_days):
     Windows are declared as a length and a kind rather than as enumerated bounds, because enumerated
     bounds terminate the series: a metric declaring four weekly windows goes quiet after week four
     even though the experiment runs for months. Generating from a rule means the series extends for
-    as long as the experiment does.
+    as long as the experiment does, unless the rule's own `repeat` is false, in which case it
+    produces at most its one window and stops there regardless of how much further tenure reaches.
 
     Only windows some unit could have completed are generated, so there is no window here that could
     not be computed. A window needs `end + 1` days of tenure to be complete.
@@ -322,6 +343,8 @@ def generate_windows(rule, tenure_days):
         if window.end + 1 > tenure_days:
             return windows
         windows.append(window)
+        if not rule.get("repeat", True):
+            return windows
         index += 1
         if index > 1000:  # a runaway guard, not a real limit
             raise RuntimeError(f"window generation did not terminate for rule {rule}")
@@ -337,8 +360,7 @@ def window_at(rule, index):
         raise ValueError(
             f"unknown window kind {kind!r}; expected disjoint or cumulative"
         )
-    prefix = "week" if kind == "disjoint" else "cumu"
-    return Window(label=f"{prefix}:{index}", start=start, end=end, kind=kind)
+    return Window(label=window_label(kind, start, end), start=start, end=end, kind=kind)
 
 
 def windows_for(metric, tenure_days):
@@ -352,12 +374,20 @@ def windows_for(metric, tenure_days):
 
 
 def reported_windows(metric, experiment, as_of):
+    """Every window to show for this metric: its matured windows, plus the next one to come.
+
+    A rule whose `repeat` is false has only the one window `generate_windows` ever produces, so
+    there is a next one to show only before that window has matured; once it has, the rule has
+    nothing more to report and no "upcoming" window is appended after it.
+    """
     tenure = experiment.tenure_days(as_of)
     windows = []
     for rule in metric.window_rules:
         matured = generate_windows(rule, min(tenure, MAX_WINDOW_DAYS))
-        upcoming = window_at(rule, len(matured) + 1)
         windows.extend(matured)
+        if matured and not rule.get("repeat", True):
+            continue
+        upcoming = window_at(rule, len(matured) + 1)
         if not experiment.ended(as_of) and upcoming.end + 1 <= MAX_WINDOW_DAYS:
             windows.append(upcoming)
     return sorted(

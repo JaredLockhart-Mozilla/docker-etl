@@ -505,7 +505,7 @@ class UnitCountFailingClient:
     ROW = dict(
         slug="a-slug",
         metric="a-metric",
-        window_label="week:1",
+        window_label="0-7d",
         segment="all_enrolled",
         branch="control",
         n=10,
@@ -624,7 +624,7 @@ def test_a_failed_segment_source_marks_only_its_own_segments_cells_as_error(capl
     # The segment's name is kept, not dropped: its failure shows on its own cells instead.
     assert returned_segment_names == segment_names_by_slug
     assert extra_segment_units_by_slug == {}
-    assert list(cells_by_slug["a-slug"]) == [("a-metric", "week:1", "all_enrolled", "control")]
+    assert list(cells_by_slug["a-slug"]) == [("a-metric", "0-7d", "all_enrolled", "control")]
     assert set(source_failures) == {("clients_last_seen", "client_id")}
     clients_last_seen_error = source_failures[("clients_last_seen", "client_id")]
     assert "the unit segments write failed" in str(clients_last_seen_error)
@@ -701,8 +701,8 @@ def test_one_failing_segment_source_leaves_the_runs_other_segment_intact(caplog)
     assert failure is None
     assert set(source_failures) == {("newtab", "client_id")}
     assert set(cells_by_slug["a-slug"]) == {
-        ("a-metric", "week:1", "all_enrolled", "control"),
-        ("a-metric", "week:1", "regular_user", "control"),
+        ("a-metric", "0-7d", "all_enrolled", "control"),
+        ("a-metric", "0-7d", "regular_user", "control"),
     }
     assert "segment source 'newtab'" in caplog.text
 
@@ -835,7 +835,7 @@ def test_a_failed_unit_count_keeps_the_cells_the_shared_scan_computed(caplog):
     assert failure is None
     assert units_by_slug == {}
     assert list(cells_by_slug) == ["a-slug"]
-    assert cells_by_slug["a-slug"][("a-metric", "week:1", "all_enrolled", "control")]["n"] == 10
+    assert cells_by_slug["a-slug"][("a-metric", "0-7d", "all_enrolled", "control")]["n"] == 10
     assert segment_names_by_slug == {}
     assert source_failures == {}
     assert timings

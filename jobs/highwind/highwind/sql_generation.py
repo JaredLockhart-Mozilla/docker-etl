@@ -516,7 +516,7 @@ def build_source_query(
         {_indent(unit_buckets_cte(run))}
         ){segments_block},
         unit_windows AS (
-        {_indent(unit_windows_cte(metrics, needs_segments))}
+        {_indent(unit_windows_cte(run, metrics, needs_segments))}
         ){quantiles_block}
         {rollup_select(metrics, run)}
     """).strip()
@@ -936,17 +936,19 @@ def unit_buckets_cte(run):
     """).strip()
 
 
-def unit_windows_cte(metrics, needs_segments=False):
+def unit_windows_cte(run, metrics, needs_segments=False):
     """STAGE B: each bucket's row carries the value of every window that ends on it.
 
     A cumulative window is the running total to this bucket, which is a window function over a
     units-by-buckets table rather than a second pass over source rows. The table is smaller than the
     source rows it came from, so the whole window series costs one sort.
 
-    The window LABEL is arithmetic on the bucket index rather than a lookup, which is what lets one
-    query serve experiments of different ages: the window ending on bucket b is always the (b+1)th
-    of its family. Experiments differ only in how many buckets they reach, and that is already
-    enforced upstream by `matured_buckets`.
+    The window LABEL is a lookup keyed on the bucket position, built once per kind by
+    `window_label_cases` from `discovery.window_at`, the same function that labels a metric's own
+    windows. A bucket's days on the grid are `bucket * run.length` to `(bucket + 1) * run.length`,
+    always, regardless of which metric's rule happens to be read off it, which is what lets a
+    single non-repeating window and a repeating family's window of the same length share one label
+    and one cell even though their rules disagree about how many windows exist before or after it.
 
     The metric's threshold is applied HERE, to the combined raw value, and only here. The covariate
     is the pre bucket's raw value read across the partition, so it is one value per unit rather than
@@ -962,9 +964,7 @@ def unit_windows_cte(metrics, needs_segments=False):
     """
     kinds = sorted({rule["kind"] for metric in metrics for rule in metric.window_rules})
     labels = "".join(
-        f"  IF(grid.bucket >= 0, CONCAT('{_PREFIX[kind]}:', grid.bucket + 1), NULL)"
-        f" AS {kind}_window,\n"
-        for kind in kinds
+        f"  {window_label_cases(kind, run)} AS {kind}_window,\n" for kind in kinds
     )
     values = ",\n  ".join(
         [
@@ -1007,9 +1007,24 @@ def unit_windows_cte(metrics, needs_segments=False):
     """).strip()
 
 
-# The label a window of each family carries. Kept beside the arithmetic that builds it, since the
-# two have to agree with `discovery.generate_windows` for a cell to be found by the statistics.
-_PREFIX = {"cumulative": "cumu", "disjoint": "week"}
+def window_label_cases(kind, run):
+    """The SQL expression mapping a bucket position to the label its window of `kind` carries.
+
+    Built by calling `discovery.window_at` for every bucket this run can reach, the same function
+    discovery itself calls to label a metric's own windows, rather than reimplementing the day
+    arithmetic in SQL where it could drift from discovery's. One query serves experiments of
+    different ages off the same grid, so the branches cover every bucket any of them could reach,
+    0 up to the deepest experiment's own horizon (`run.buckets_by_slug`); a bucket past an
+    experiment's own horizon never appears as `grid.bucket` for it, so an unreachable branch is
+    simply never taken.
+    """
+    rule = {"kind": kind, "length": run.length}
+    max_bucket = max(run.buckets_by_slug.values(), default=0)
+    whens = "".join(
+        f"WHEN grid.bucket = {bucket} THEN '{discovery.window_at(rule, bucket + 1).label}' "
+        for bucket in range(max_bucket)
+    )
+    return f"IF(grid.bucket >= 0, CASE {whens}END, NULL)"
 
 
 def window_value(metric, kind):

@@ -104,9 +104,9 @@ RESULTS_SCHEMA = [
         "window",
         "STRING",
         description=(
-            "Window label, relative to each unit's own enrollment rather than the calendar. "
-            "cumu:N is the cumulative window covering a unit's first N weeks; week:N is the Nth "
-            "disjoint week."
+            "Window label, relative to each unit's own enrollment rather than the calendar, named "
+            "by the days it covers. '{N}d' is the cumulative window covering a unit's first N "
+            "days; '{start}-{end}d' is the disjoint window covering days start to end."
         ),
     ),
     bigquery.SchemaField(
@@ -242,9 +242,10 @@ SUFFICIENT_STATS_SCHEMA = [
         "window",
         "STRING",
         description=(
-            "Window label, relative to each unit's own enrollment rather than the calendar. "
-            "cumu:N is the cumulative window covering a unit's first N weeks; week:N is the Nth "
-            "disjoint week. Joins to highwind_statistics_v1.window."
+            "Window label, relative to each unit's own enrollment rather than the calendar, named "
+            "by the days it covers. '{N}d' is the cumulative window covering a unit's first N "
+            "days; '{start}-{end}d' is the disjoint window covering days start to end. Joins to "
+            "highwind_statistics_v1.window."
         ),
     ),
     bigquery.SchemaField(

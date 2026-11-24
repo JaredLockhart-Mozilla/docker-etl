@@ -33,18 +33,18 @@ def metric(*window_rules):
     )
 
 
-def test_cumulative_windows_are_labelled_cumu_and_all_start_at_enrollment():
+def test_cumulative_windows_are_labelled_by_the_days_they_cover_and_all_start_at_enrollment():
     windows = discovery.generate_windows(CUMULATIVE_WEEKLY, tenure_days=21)
 
-    assert [window.label for window in windows] == ["cumu:1", "cumu:2", "cumu:3"]
+    assert [window.label for window in windows] == ["7d", "14d", "21d"]
     assert [(window.start, window.end) for window in windows] == [(0, 6), (0, 13), (0, 20)]
     assert [window.length for window in windows] == [7, 14, 21]
 
 
-def test_disjoint_windows_are_labelled_week_and_partition_tenure():
+def test_disjoint_windows_are_labelled_by_their_day_span_and_partition_tenure():
     windows = discovery.generate_windows(DISJOINT_WEEKLY, tenure_days=21)
 
-    assert [window.label for window in windows] == ["week:1", "week:2", "week:3"]
+    assert [window.label for window in windows] == ["0-7d", "7-14d", "14-21d"]
     assert [(window.start, window.end) for window in windows] == [(0, 6), (7, 13), (14, 20)]
     assert [window.length for window in windows] == [7, 7, 7]
 
@@ -52,20 +52,51 @@ def test_disjoint_windows_are_labelled_week_and_partition_tenure():
 def test_a_window_is_generated_only_once_a_unit_could_have_completed_it():
     assert discovery.generate_windows(CUMULATIVE_WEEKLY, tenure_days=6) == []
     assert [window.label for window in discovery.generate_windows(CUMULATIVE_WEEKLY, 7)] == [
-        "cumu:1"
+        "7d"
     ]
     assert [window.label for window in discovery.generate_windows(CUMULATIVE_WEEKLY, 13)] == [
-        "cumu:1"
+        "7d"
     ]
     assert [window.label for window in discovery.generate_windows(CUMULATIVE_WEEKLY, 14)] == [
-        "cumu:1",
-        "cumu:2",
+        "7d",
+        "14d",
     ]
+
+
+def test_a_single_window_and_a_repeating_windows_fourth_step_share_one_label():
+    # The point of labelling by days rather than by index: a lone 28-day window and the fourth
+    # window of a repeating 7-day cumulative rule cover the same days and must read as one window.
+    single = discovery.generate_windows(
+        {"kind": "cumulative", "length": 28, "repeat": False}, tenure_days=28
+    )
+    repeating = discovery.generate_windows(CUMULATIVE_WEEKLY, tenure_days=28)
+
+    assert [window.label for window in single] == ["28d"]
+    assert repeating[-1].label == "28d"
+    assert single[0] == repeating[-1]
 
 
 def test_an_unrecognised_window_kind_is_refused_rather_than_guessed_at():
     with pytest.raises(ValueError):
         discovery.generate_windows({"kind": "rolling", "length": 7}, tenure_days=30)
+
+
+@pytest.mark.parametrize("length", [7, 14, 28])
+def test_a_non_repeating_rule_produces_exactly_one_window_once_it_matures(length):
+    rule = {"kind": "cumulative", "length": length, "repeat": False}
+
+    assert discovery.generate_windows(rule, tenure_days=length - 1) == []
+    matured = discovery.generate_windows(rule, tenure_days=length)
+    assert [window.label for window in matured] == [f"{length}d"]
+    assert (matured[0].start, matured[0].end) == (0, length - 1)
+
+
+def test_a_non_repeating_rule_stays_at_one_window_however_far_tenure_reaches():
+    rule = {"kind": "cumulative", "length": 7, "repeat": False}
+
+    windows = discovery.generate_windows(rule, tenure_days=10 * 365)
+
+    assert [window.label for window in windows] == ["7d"]
 
 
 def test_the_window_series_stops_at_the_horizon_however_long_the_experiment_ran():
@@ -80,7 +111,7 @@ def test_a_metric_declaring_both_families_gets_the_windows_of_each():
         metric(CUMULATIVE_WEEKLY, DISJOINT_WEEKLY), tenure_days=14
     )
 
-    assert [window.label for window in windows] == ["cumu:1", "cumu:2", "week:1", "week:2"]
+    assert [window.label for window in windows] == ["7d", "14d", "0-7d", "7-14d"]
 
 
 def test_tenure_is_counted_from_the_first_enrollment_to_the_run_date():
@@ -467,3 +498,22 @@ def test_a_window_matures_the_day_after_its_last_day_since_the_start():
 
     assert discovery.matures_on(started, first) == datetime.date(2026, 7, 8)
     assert discovery.matures_on(started, second) == datetime.date(2026, 7, 15)
+
+
+def test_a_non_repeating_window_is_reported_as_upcoming_before_it_matures():
+    rule = {"kind": "cumulative", "length": 7, "repeat": False}
+
+    windows = discovery.reported_windows(metric(rule), experiment(AS_OF), AS_OF)
+
+    assert [(window.start, window.end) for window in windows] == [(0, 6)]
+    assert discovery.has_matured(experiment(AS_OF), windows[0], AS_OF) is False
+
+
+def test_a_non_repeating_window_reports_nothing_more_once_it_has_matured():
+    rule = {"kind": "cumulative", "length": 7, "repeat": False}
+    running = experiment(AS_OF - datetime.timedelta(days=30))
+
+    windows = discovery.reported_windows(metric(rule), running, AS_OF)
+
+    assert [(window.start, window.end) for window in windows] == [(0, 6)]
+    assert discovery.has_matured(running, windows[0], AS_OF) is True

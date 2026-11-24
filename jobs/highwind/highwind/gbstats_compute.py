@@ -317,6 +317,18 @@ def excludes_zero(interval):
 
 
 def windows_for_metric(metric, windows):
-    """Select the windows this metric declares, out of the run's full window set."""
-    kinds = {rule["kind"] for rule in metric.window_rules}
-    return [window for window in windows if window.kind in kinds]
+    """Select the windows this metric declares, out of the run's full window set.
+
+    Matched by label against windows `metric`'s own rules would generate, not by kind alone: an
+    experiment usually carries several metrics of the same kind, and a single, non-repeating
+    window's own rule produces only its one window while a repeating metric sharing the pool
+    matures many. Filtering on kind alone would evaluate the single-window metric at every
+    checkpoint the repeating one reaches, inflating the cell count with results nobody reads.
+    `tenure` only needs to reach the deepest window already in the pool, since nothing deeper could
+    be in it to match.
+    """
+    if not windows:
+        return []
+    tenure = max(window.end for window in windows) + 1
+    own_labels = {window.label for window in discovery.windows_for(metric, tenure)}
+    return [window for window in windows if window.label in own_labels]

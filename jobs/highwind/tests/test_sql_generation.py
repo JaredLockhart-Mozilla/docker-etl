@@ -104,7 +104,12 @@ def experiment(slug, start_date, unit=CLIENT_UNIT, metric_names=()):
 
 def cumulative_windows(count):
     return [
-        Window(label=f"cumu:{index}", start=0, end=index * 7 - 1, kind="cumulative")
+        Window(
+            label=discovery.window_label("cumulative", 0, index * 7 - 1),
+            start=0,
+            end=index * 7 - 1,
+            kind="cumulative",
+        )
         for index in range(1, count + 1)
     ]
 
@@ -112,7 +117,7 @@ def cumulative_windows(count):
 def disjoint_windows(count):
     return [
         Window(
-            label=f"week:{index}",
+            label=discovery.window_label("disjoint", (index - 1) * 7, index * 7 - 1),
             start=(index - 1) * 7,
             end=index * 7 - 1,
             kind="disjoint",
@@ -161,8 +166,8 @@ def test_a_weekly_window_set_yields_a_weekly_bucket_grid():
 
 def test_disjoint_windows_of_different_lengths_have_no_common_grid():
     windows = [
-        Window(label="week:1", start=0, end=6, kind="disjoint"),
-        Window(label="fortnight:1", start=7, end=20, kind="disjoint"),
+        Window(label="0-7d", start=0, end=6, kind="disjoint"),
+        Window(label="7-21d", start=7, end=20, kind="disjoint"),
     ]
 
     with pytest.raises(ValueError):
@@ -170,7 +175,7 @@ def test_disjoint_windows_of_different_lengths_have_no_common_grid():
 
 
 def test_a_cumulative_window_that_does_not_start_at_enrollment_is_refused():
-    windows = [Window(label="cumu:2", start=7, end=13, kind="cumulative")]
+    windows = [Window(label="14d", start=7, end=13, kind="cumulative")]
 
     with pytest.raises(ValueError):
         sql_generation.bucket_length(windows)
@@ -179,7 +184,7 @@ def test_a_cumulative_window_that_does_not_start_at_enrollment_is_refused():
 def test_a_cumulative_window_off_the_grid_is_refused():
     windows = [
         *disjoint_windows(1),
-        Window(label="cumu:1", start=0, end=9, kind="cumulative"),
+        Window(label="10d", start=0, end=9, kind="cumulative"),
     ]
 
     with pytest.raises(ValueError):
@@ -402,10 +407,75 @@ def test_the_sql_and_discovery_build_a_window_label_the_same_way():
         windows = discovery.windows_for(metric, tenure_days=60)
 
         assert windows, f"the generator emitted no {kind} window to check"
-        assert set(sql_generation._PREFIX) == {"cumulative", "disjoint"}
         for window in windows:
             assert window.kind == kind
-            assert window.label.startswith(f"{sql_generation._PREFIX[kind]}:")
+            assert window.label == discovery.window_label(kind, window.start, window.end)
+
+
+@pytest.mark.parametrize("length", [14, 28])
+def test_a_single_windows_sql_label_matches_discoverys_even_off_its_own_rules_grid(length):
+    # The regression this guards: a single window's length need not equal the run's shared bucket
+    # length, because another experiment's ordinary weekly metric can force the grid to 7 days
+    # while this metric's one window spans several of those buckets. Labelling the bucket by its
+    # own position used to assume index == bucket + 1, which only held when a rule's own length
+    # equalled the grid; naming it by days instead (`window_label_cases`, read off the same
+    # `discovery.window_at` discovery itself calls) makes the two agree regardless of whose rule
+    # set the grid.
+    run = run_of(
+        {
+            "single-window": [
+                Window(label=f"{length}d", start=0, end=length - 1, kind="cumulative")
+            ],
+            "weekly": disjoint_windows(1),
+        }
+    )
+    assert run.length == 7
+
+    case = sql_generation.window_label_cases("cumulative", run)
+
+    single_window_bucket = run.buckets_by_slug["single-window"] - 1
+    assert f"WHEN grid.bucket = {single_window_bucket} THEN '{length}d'" in case
+    assert discovery.window_at({"kind": "cumulative", "length": length}, 1).label == f"{length}d"
+
+
+@pytest.mark.parametrize("length", [14, 28])
+def test_a_single_windows_full_total_is_tagged_with_its_own_label_end_to_end(length):
+    # End to end through SQL generation: the cumulative running sum at a bucket is always the full
+    # total through that bucket's own last day, so the row it lands in must carry that day span's
+    # own label, not whatever a naive index would have given it. Built on the same mixed grid as
+    # above (another experiment's ordinary weekly metric forces the shared bucket length to 7, so a
+    # 14- or 28-day single window spans more than one bucket).
+    run = run_of(
+        {
+            "single-window": [
+                Window(label=f"{length}d", start=0, end=length - 1, kind="cumulative")
+            ],
+            "weekly": disjoint_windows(1),
+        },
+        metric_names_by_slug={
+            "single-window": ("one_off",),
+            "weekly": ("retained_dau",),
+        },
+    )
+    one_off = metrics.Metric(
+        name="one_off",
+        source="clients_daily",
+        reducer=reducer("SUM(active_hours_sum)"),
+        window_rules=({"kind": "cumulative", "length": length, "repeat": False},),
+    )
+
+    sql = sql_generation.build_source_query(
+        run, "clients_daily", [one_off], CLIENTS_DAILY_SOURCE, "a.cohort_table", CLIENT_UNIT,
+    )
+
+    single_window_bucket = run.buckets_by_slug["single-window"] - 1
+    assert f"WHEN grid.bucket = {single_window_bucket} THEN '{length}d'" in sql
+    # The running total is summed over every bucket up to and including this one, OVER
+    # unit_to_date, which is what makes the row tagged f"{length}d" the full length-day total
+    # rather than a partial one: nothing about that arithmetic changed here, only which label the
+    # row carries.
+    assert "SUM(IF(grid.bucket >= 0, bucket_total.one_off__raw, NULL)) OVER unit_to_date" in sql
+    assert "STRUCT('one_off' AS metric, cumulative_window AS window_label" in sql
 
 
 def test_a_source_query_reads_the_column_the_experiments_unit_names():
@@ -927,7 +997,8 @@ SUGGEST_USER = segments.Segment(
 
 
 def test_unit_windows_cte_defaults_every_unit_to_just_all_enrolled_when_dark():
-    sql = sql_generation.unit_windows_cte([named("active_hours")], needs_segments=False)
+    run = run_of({"a-slug": cumulative_windows(1)})
+    sql = sql_generation.unit_windows_cte(run, [named("active_hours")], needs_segments=False)
 
     assert "['all_enrolled'] AS segments" in sql
     assert "unit_segments" not in sql
@@ -935,7 +1006,8 @@ def test_unit_windows_cte_defaults_every_unit_to_just_all_enrolled_when_dark():
 
 
 def test_unit_windows_cte_joins_unit_segments_when_a_run_resolved_one():
-    sql = sql_generation.unit_windows_cte([named("active_hours")], needs_segments=True)
+    run = run_of({"a-slug": cumulative_windows(1)})
+    sql = sql_generation.unit_windows_cte(run, [named("active_hours")], needs_segments=True)
 
     assert "ARRAY_CONCAT(['all_enrolled'], COALESCE(unit_segments.extra_segments, []))" in sql
     assert "LEFT JOIN unit_segments" in sql
@@ -947,7 +1019,8 @@ def test_a_unit_matching_no_resolved_segment_still_carries_all_enrolled():
     # run's resolved segments; COALESCE to an empty array before the CONCAT is what keeps
     # `all_enrolled` in its `segments` array regardless, rather than that unit vanishing from the
     # breakdown it would get if the array were NULL and UNNEST dropped the row.
-    sql = sql_generation.unit_windows_cte([named("active_hours")], needs_segments=True)
+    run = run_of({"a-slug": cumulative_windows(1)})
+    sql = sql_generation.unit_windows_cte(run, [named("active_hours")], needs_segments=True)
 
     assert "COALESCE(unit_segments.extra_segments, [])" in sql
     assert sql.index("['all_enrolled']") < sql.index("COALESCE(unit_segments.extra_segments")
