@@ -6,7 +6,12 @@ import types
 
 import pytest
 from metric_config_parser.aggregation import BucketedAggregation, Combine
-from metric_config_parser.aggregation_plan import AggregationSource
+from metric_config_parser.aggregation_plan import (
+    AggregationMetric,
+    AggregationPlan,
+    AggregationRatio,
+    AggregationSource,
+)
 from mozilla_nimbus_schemas.highwind import HighwindAnalysis
 
 from highwind import analysis, output_writing, segments, sql_generation, units
@@ -18,7 +23,7 @@ from highwind.gbstats_compute import (
     INSUFFICIENT_DATA,
     NOT_STARTED,
 )
-from highwind.metrics import CUMULATIVE_WEEKLY, Metric
+from highwind.metrics import CUMULATIVE_WEEKLY, Metric, Ratio
 
 AS_OF = datetime.date(2026, 8, 20)
 
@@ -923,3 +928,90 @@ def test_experiment_segment_names_is_just_all_enrolled_for_an_unlisted_slug():
     experiment = experiment_selecting(["regular_user"])
 
     assert analysis.experiment_segment_names(experiment, {}) == ("all_enrolled",)
+
+
+class FakeMetricConfigs:
+    def get_nimbus_metric_definition(self, name, app_name):
+        return types.SimpleNamespace(aggregation="sum", threshold=None)
+
+
+def ratio_aggregation_metric(name, data_source):
+    return AggregationMetric(
+        name=name,
+        data_source=data_source,
+        aggregation=BucketedAggregation(
+            bucket_aggregate=f"SUM({name}_sum)",
+            combine=Combine.SUM,
+            no_rows="0",
+            finalize="{combined}",
+        ),
+        cumulative_window=7,
+        incremental_window=None,
+        repeat_windows=True,
+        is_binary=False,
+        winsorize_quantile=None,
+        winsorize_threshold=None,
+    )
+
+
+def experiment_requesting(metric_names):
+    return Experiment(
+        slug="a-slug",
+        start_date=datetime.date(2026, 7, 1),
+        end_date=None,
+        reference_branch="control",
+        treatment_branches=("treatment",),
+        unit=units.resolve("firefox_desktop", "normandy_id"),
+        metrics={
+            name: MetricDisplay(friendly_name=None, description=None, bigger_is_better=None)
+            for name in metric_names
+        },
+    )
+
+
+def test_a_resolving_parser_fills_a_ratio_and_its_experiment_list(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+
+    def fake_build_aggregation_plan(configs, metric_names):
+        return AggregationPlan(
+            sources={},
+            metrics={
+                "ad_clicks": ratio_aggregation_metric("ad_clicks", "newtab"),
+                "search_count": ratio_aggregation_metric("search_count", "newtab"),
+            },
+            ratios={
+                "ad_click_rate": AggregationRatio(
+                    name="ad_click_rate", numerator="ad_clicks", denominator="search_count"
+                )
+            },
+            missing=[name for name in metric_names if name != "ad_click_rate"],
+        )
+
+    monkeypatch.setattr(analysis, "build_aggregation_plan", fake_build_aggregation_plan)
+    experiment = experiment_requesting(["ad_click_rate", "an_unresolvable_metric"])
+
+    metrics_by_slug, ratios_by_slug, resolved_metrics, resolved_ratios, _ = (
+        analysis.resolve_run_metrics([experiment], configs=FakeMetricConfigs())
+    )
+
+    assert set(resolved_ratios) == {"ad_click_rate"}
+    assert metrics_by_slug == {"a-slug": []}
+    assert [ratio.name for ratio in ratios_by_slug["a-slug"]] == ["ad_click_rate"]
+    assert ratios_by_slug["a-slug"][0].numerator.name == "ad_clicks"
+    assert ratios_by_slug["a-slug"][0].denominator.name == "search_count"
+    assert "an_unresolvable_metric' not computed" in caplog.text
+    assert "ad_click_rate' not computed" not in caplog.text
+
+
+def test_run_windows_covers_both_an_experiments_metrics_and_its_ratios():
+    ratio = Ratio(
+        name="ad_click_rate",
+        numerator=TEST_METRICS[0],
+        denominator=TEST_METRICS[0],
+        window_rules=(CUMULATIVE_WEEKLY,),
+    )
+
+    windows = analysis.run_windows(EXPERIMENT, AS_OF, (*TEST_METRICS, ratio))
+
+    assert {window.kind for window in windows} == {"cumulative"}
+    assert windows

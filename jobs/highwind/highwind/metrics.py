@@ -124,6 +124,36 @@ class Metric:
 
 
 @dataclass(frozen=True)
+class Ratio:
+    """One ratio metric: its numerator and denominator, each an ordinary resolved `Metric` this
+    run also computes a sum for, and the window rules the two share.
+
+    A ratio has no reducer, source or winsorize setting of its own: `numerator.source` is the
+    source its per-unit values are read from (the two are required to match; see
+    `split_resolved_ratios`), and a ratio's own window is never clipped (see
+    `sql_generation.ratio_rollup_select`), regardless of either component's own winsorize
+    setting as a standalone metric.
+
+    Args:
+        name (str): The ratio's name, as metric-hub and the Experimenter mirror know it.
+        numerator (Metric): The resolved metric summed as the ratio's numerator.
+        denominator (Metric): The resolved metric summed as the ratio's denominator.
+        window_rules (tuple): The window rules this ratio reports, shared by both components.
+        friendly_name (str, optional): Display name the mirror carried for this ratio, for the
+            experiment that asked for it. Defaults to None.
+        description (str, optional): Display description, from the same source as
+            `friendly_name`. Defaults to None.
+    """
+
+    name: str
+    numerator: Metric
+    denominator: Metric
+    window_rules: tuple
+    friendly_name: str | None = None
+    description: str | None = None
+
+
+@dataclass(frozen=True)
 class UnresolvedMetric:
     """A metric name an experiment asked for that this run could not compute, and why."""
 
@@ -220,6 +250,62 @@ def split_resolved_metrics(plan):
     return resolved, unresolved
 
 
+def _window_rule_set(window_rules):
+    """A window-rule tuple as an order-independent set, for comparing two metrics' own rules."""
+    return frozenset(frozenset(rule.items()) for rule in window_rules)
+
+
+def split_resolved_ratios(plan, resolved_metrics, unresolved_metrics):
+    """Split one run's plan ratios into the ones Highwind can compute and the ones it cannot.
+
+    The parser already resolved and committed each ratio's numerator and denominator as ordinary
+    plan metrics (see `aggregation_plan()`), so this only has to look the two up in
+    `resolved_metrics` (built by `split_resolved_metrics` from the same plan) and check the two
+    extra things Highwind's own SQL needs that the parser does not enforce: the components must
+    read the same metric-hub source, since a ratio's cross products are computed from one query's
+    own per-unit rows (`sql_generation.ratio_rollup_select`) rather than a join across two, and
+    they must declare the same windows, since a ratio has no window declaration of its own to fall
+    back on. A component that Highwind itself could not resolve (`window_rules` rejected its own
+    windows) fails the ratio the same way a missing component does.
+    """
+    resolved, unresolved = {}, {}
+    for name, ratio in plan.ratios.items():
+        numerator = resolved_metrics.get(ratio.numerator)
+        denominator = resolved_metrics.get(ratio.denominator)
+        if numerator is None:
+            reason = unresolved_metrics.get(
+                ratio.numerator, "no nimbus/ definition for this app"
+            )
+            unresolved[name] = f"numerator '{ratio.numerator}' not computed: {reason}"
+            continue
+        if denominator is None:
+            reason = unresolved_metrics.get(
+                ratio.denominator, "no nimbus/ definition for this app"
+            )
+            unresolved[name] = f"denominator '{ratio.denominator}' not computed: {reason}"
+            continue
+        if numerator.source != denominator.source:
+            unresolved[name] = (
+                f"numerator '{ratio.numerator}' reads source '{numerator.source}' but "
+                f"denominator '{ratio.denominator}' reads '{denominator.source}'; a ratio's "
+                f"numerator and denominator must read the same metric-hub source"
+            )
+            continue
+        if _window_rule_set(numerator.window_rules) != _window_rule_set(denominator.window_rules):
+            unresolved[name] = (
+                f"numerator '{ratio.numerator}' and denominator '{ratio.denominator}' declare "
+                f"different windows"
+            )
+            continue
+        resolved[name] = Ratio(
+            name=name,
+            numerator=numerator,
+            denominator=denominator,
+            window_rules=numerator.window_rules,
+        )
+    return resolved, unresolved
+
+
 def winsorize_mode(metric):
     """Resolve one metric's `winsorize_quantile`/`winsorize_threshold` into a mode and value.
 
@@ -269,16 +355,25 @@ def group_by_source(resolved_metrics):
     return by_source
 
 
-def metrics_for_experiment(experiment, resolved_metrics, unresolved_metrics):
+def metrics_for_experiment(experiment, resolved_metrics, unresolved_metrics, ratio_names=()):
     """One experiment's own metric list, with its own display text, and the names it could not get.
 
     A metric's aggregation shape is the same for every experiment that reads it, so
     `resolved_metrics` is resolved once for the whole run; this keeps only the names the experiment
     itself asked for and attaches the friendly name and description the mirror carried for THAT
     experiment, which can differ from another experiment's text for a metric of the same name.
+
+    `ratio_names` is every name this run attempted to resolve as a ratio (`resolved_ratios` and
+    `unresolved_ratios` together, from `split_resolved_ratios`), skipped here rather than reported:
+    a ratio's own name is deliberately absent from both `resolved_metrics` and `unresolved_metrics`
+    (the parser resolves it into `plan.ratios` instead, never `plan.metrics`), so without this list
+    every ratio, resolved or not, would default to "no nimbus/ definition for this app" here on top
+    of whatever `ratios_for_experiment` already reports for it.
     """
     chosen, problems = [], []
     for name in experiment.metric_names:
+        if name in ratio_names:
+            continue
         metric = resolved_metrics.get(name)
         if metric is None:
             reason = unresolved_metrics.get(name, "no nimbus/ definition for this app")
@@ -298,4 +393,32 @@ def metrics_for_experiment(experiment, resolved_metrics, unresolved_metrics):
                 is_yes_no=metric.is_yes_no,
             )
         )
+    return chosen, problems
+
+
+def ratios_for_experiment(experiment, resolved_ratios, unresolved_ratios):
+    """One experiment's own ratio list, with its own display text, and the names it could not get.
+
+    Mirrors `metrics_for_experiment`, restricted to the names this run resolved or failed to
+    resolve as a ratio (`resolved_ratios`/`unresolved_ratios`, from `split_resolved_ratios`): a
+    name in `experiment.metric_names` that is neither is an ordinary metric name, already reported
+    by `metrics_for_experiment`, and is silently skipped here rather than reported twice.
+    """
+    chosen, problems = [], []
+    for name in experiment.metric_names:
+        ratio = resolved_ratios.get(name)
+        if ratio is not None:
+            display = experiment.metrics.get(name)
+            chosen.append(
+                Ratio(
+                    name=ratio.name,
+                    numerator=ratio.numerator,
+                    denominator=ratio.denominator,
+                    window_rules=ratio.window_rules,
+                    friendly_name=display.friendly_name if display else None,
+                    description=display.description if display else None,
+                )
+            )
+        elif name in unresolved_ratios:
+            problems.append(UnresolvedMetric(name=name, reason=unresolved_ratios[name]))
     return chosen, problems

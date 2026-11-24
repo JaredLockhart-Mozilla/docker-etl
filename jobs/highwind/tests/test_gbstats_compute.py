@@ -4,6 +4,7 @@ import datetime
 import logging
 
 import pytest
+from gbstats.models.statistics import compute_theta_regression_adjusted_ratio
 
 from highwind import gbstats_compute, metrics, units
 from highwind.discovery import Experiment, Window
@@ -486,3 +487,213 @@ def test_any_other_gbstats_message_is_an_error_carrying_that_message(monkeypatch
     assert result["state"] == gbstats_compute.ERROR
     assert "SOME_OTHER_GBSTATS_MESSAGE" in result["error"]
     assert "point" not in result
+
+
+RATIO = metrics.Ratio(
+    name="ad_click_rate",
+    numerator=metrics.Metric(
+        name="ad_clicks", source="newtab", reducer=None, window_rules=(metrics.CUMULATIVE_WEEKLY,)
+    ),
+    denominator=metrics.Metric(
+        name="search_count",
+        source="newtab",
+        reducer=None,
+        window_rules=(metrics.CUMULATIVE_WEEKLY,),
+    ),
+    window_rules=(metrics.CUMULATIVE_WEEKLY,),
+)
+
+
+def ratio_branch(records):
+    """One branch's ratio sufficient-stats cell, summed from explicit per-unit
+    (m_post, d_post, m_pre, d_pre) tuples the same way `sql_generation.ratio_rollup_select` sums
+    per-unit window values in BigQuery."""
+    n = len(records)
+    return dict(
+        n=n,
+        sum_m=sum(m_post for m_post, d_post, m_pre, d_pre in records),
+        sum_m_squares=sum(m_post**2 for m_post, d_post, m_pre, d_pre in records),
+        sum_d=sum(d_post for m_post, d_post, m_pre, d_pre in records),
+        sum_d_squares=sum(d_post**2 for m_post, d_post, m_pre, d_pre in records),
+        sum_m_d=sum(m_post * d_post for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_m=sum(m_pre for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_m_squares=sum(m_pre**2 for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_d=sum(d_pre for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_d_squares=sum(d_pre**2 for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_m_d=sum(m_pre * d_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_m_post_m_pre=sum(m_post * m_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_d_post_d_pre=sum(d_post * d_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_m_post_d_pre=sum(m_post * d_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_m_pre_d_post=sum(m_pre * d_post for m_post, d_post, m_pre, d_pre in records),
+    )
+
+
+REFERENCE_RECORDS = [(1, 10, 1, 10), (2, 11, 2, 9), (0, 9, 1, 11), (3, 12, 2, 10), (1, 8, 0, 8)]
+TREATMENT_RECORDS = [(2, 10, 1, 10), (3, 11, 2, 9), (1, 9, 1, 11), (4, 12, 2, 10), (2, 8, 1, 8)]
+
+
+def test_adjusted_ratio_builds_the_statistic_gbstats_expects():
+    cell = dict(
+        n=5,
+        sum_m=11.0,
+        sum_m_squares=31.0,
+        sum_d=50.0,
+        sum_d_squares=510.0,
+        sum_m_d=116.0,
+        pre_sum_m=7.0,
+        pre_sum_m_squares=11.0,
+        pre_sum_d=48.0,
+        pre_sum_d_squares=470.0,
+        sum_m_post_m_pre=16.0,
+        sum_d_post_d_pre=481.0,
+        sum_m_post_d_pre=107.0,
+        sum_m_pre_d_post=70.0,
+        pre_sum_m_d=68.0,
+    )
+
+    statistic = gbstats_compute.adjusted_ratio(cell, theta=0.5)
+
+    assert statistic.n == 5
+    assert statistic.theta == 0.5
+    assert statistic.m_statistic_post.sum == 11.0
+    assert statistic.m_statistic_post.sum_squares == 31.0
+    assert statistic.d_statistic_post.sum == 50.0
+    assert statistic.d_statistic_post.sum_squares == 510.0
+    assert statistic.m_statistic_pre.sum == 7.0
+    assert statistic.m_statistic_pre.sum_squares == 11.0
+    assert statistic.d_statistic_pre.sum == 48.0
+    assert statistic.d_statistic_pre.sum_squares == 470.0
+    assert statistic.m_post_d_post_sum_of_products == 116.0
+    assert statistic.m_pre_d_pre_sum_of_products == 68.0
+    assert statistic.m_post_m_pre_sum_of_products == 16.0
+    assert statistic.d_post_d_pre_sum_of_products == 481.0
+    assert statistic.m_post_d_pre_sum_of_products == 107.0
+    assert statistic.m_pre_d_post_sum_of_products == 70.0
+
+
+def test_pooled_theta_ratio_matches_gbstats_own_two_branch_formula():
+    # gbstats fits a ratio's theta from exactly the pair under test
+    # (`compute_theta_regression_adjusted_ratio`); with exactly two branches,
+    # `pooled_theta_ratio`'s sum-over-every-branch generalisation must return the same value.
+    reference = ratio_branch(REFERENCE_RECORDS)
+    treatment = ratio_branch(TREATMENT_RECORDS)
+
+    pooled = gbstats_compute.pooled_theta_ratio([reference, treatment])
+
+    reference_statistic = gbstats_compute.adjusted_ratio(reference, theta=1)
+    treatment_statistic = gbstats_compute.adjusted_ratio(treatment, theta=1)
+    expected = compute_theta_regression_adjusted_ratio(reference_statistic, treatment_statistic)
+
+    assert pooled == pytest.approx(expected)
+
+
+TREATMENT_B_RECORDS = [(0, 9, 1, 11), (1, 10, 0, 9), (2, 11, 2, 8), (1, 8, 1, 10), (3, 12, 2, 9)]
+
+
+def test_three_branches_pool_a_different_theta_ratio_than_either_pair_would():
+    # The ratio analogue of test_three_branches_pool_a_different_theta_than_either_pair_would:
+    # pooling a ratio's theta over three branches is not the same number as pooling over either
+    # pair alone, so a three-arm experiment's ratio intervals move rather than being relabelled.
+    reference = ratio_branch(REFERENCE_RECORDS)
+    treatment_a = ratio_branch(TREATMENT_RECORDS)
+    treatment_b = ratio_branch(TREATMENT_B_RECORDS)
+
+    pooled = gbstats_compute.pooled_theta_ratio([reference, treatment_a, treatment_b])
+
+    for candidate in (treatment_a, treatment_b):
+        pairwise = gbstats_compute.pooled_theta_ratio([reference, candidate])
+        assert pooled != pytest.approx(pairwise, rel=1e-6)
+
+
+def test_pooled_theta_ratio_is_zero_with_fewer_than_two_units():
+    assert gbstats_compute.pooled_theta_ratio([ratio_branch(REFERENCE_RECORDS[:1])]) == 0.0
+
+
+def test_pooled_theta_ratio_is_zero_when_the_covariate_never_moves():
+    # Constant m_pre/d_pre across every unit, the ratio analogue of
+    # test_theta_is_zero_when_the_covariate_never_moves: the pre-period has no variance, so the
+    # <= 0 guard falls back to no adjustment rather than dividing by (near) zero.
+    flat_records = [(1, 10, 1, 1), (2, 11, 1, 1), (0, 9, 1, 1), (3, 12, 1, 1)]
+
+    flat = ratio_branch(flat_records)
+    assert gbstats_compute.pooled_theta_ratio([flat, flat]) == 0.0
+
+
+def test_a_ratio_metric_produces_a_populated_interval_through_compute_statistics():
+    cells = {
+        ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_branch(REFERENCE_RECORDS),
+        ("ad_click_rate", "cumu:1", "all_enrolled", "treatment-a"): ratio_branch(
+            TREATMENT_RECORDS
+        ),
+    }
+
+    results = {
+        result["branch"]: result
+        for result in gbstats_compute.compute_statistics(EXPERIMENT, [RATIO], WINDOWS, cells)
+    }
+    treatment = results["treatment-a"]
+
+    assert treatment["state"] in (gbstats_compute.FORMING, gbstats_compute.CONFIDENT)
+    assert treatment["lower"] < treatment["point"] < treatment["upper"]
+    assert treatment["theta"] == pytest.approx(
+        gbstats_compute.pooled_theta_ratio(
+            [ratio_branch(REFERENCE_RECORDS), ratio_branch(TREATMENT_RECORDS)]
+        )
+    )
+    assert "absolute" in treatment
+
+
+def test_a_ratio_cell_below_the_minimum_units_is_insufficient_data():
+    cells = {
+        ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_branch(REFERENCE_RECORDS),
+        ("ad_click_rate", "cumu:1", "all_enrolled", "treatment-a"): ratio_branch(
+            TREATMENT_RECORDS[:1]
+        ),
+    }
+
+    results = {
+        result["branch"]: result
+        for result in gbstats_compute.compute_statistics(EXPERIMENT, [RATIO], WINDOWS, cells)
+    }
+
+    assert results["treatment-a"]["state"] == gbstats_compute.INSUFFICIENT_DATA
+    assert results["treatment-a"]["n_treatment"] == 1
+
+
+def test_a_ratio_gets_only_the_windows_of_the_families_it_declares():
+    windows = gbstats_compute.windows_for_metric(RATIO, WINDOWS)
+
+    assert [window.label for window in windows] == ["cumu:1"]
+
+
+def test_an_ordinary_metric_and_a_ratio_coexist_in_one_compute_statistics_call():
+    # The real case once a ratio ships: an experiment's metrics list is a mix of its ordinary
+    # guardrails and a ratio, passed to compute_statistics together. Each metric's own pooled_theta
+    # function must be used for its own cells, with no cross-talk between the two dispatch paths.
+    cells = {
+        ("active_hours", "cumu:1", "all_enrolled", "control"): branch(1000, 1.0, 2.0, 1.5),
+        ("active_hours", "cumu:1", "all_enrolled", "treatment-a"): branch(1000, 1.1, 2.42, 1.65),
+        ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_branch(REFERENCE_RECORDS),
+        ("ad_click_rate", "cumu:1", "all_enrolled", "treatment-a"): ratio_branch(
+            TREATMENT_RECORDS
+        ),
+    }
+
+    results = gbstats_compute.compute_statistics(EXPERIMENT, [CONTINUOUS, RATIO], WINDOWS, cells)
+
+    by_metric_branch = {(result["metric"], result["branch"]): result for result in results}
+    assert {metric for metric, _ in by_metric_branch} == {"active_hours", "ad_click_rate"}
+    mean_treatment = by_metric_branch[("active_hours", "treatment-a")]
+    ratio_treatment = by_metric_branch[("ad_click_rate", "treatment-a")]
+    assert mean_treatment["state"] in (gbstats_compute.FORMING, gbstats_compute.CONFIDENT)
+    assert ratio_treatment["state"] in (gbstats_compute.FORMING, gbstats_compute.CONFIDENT)
+    assert mean_treatment["theta"] == pytest.approx(
+        gbstats_compute.pooled_theta(
+            [branch(1000, 1.0, 2.0, 1.5), branch(1000, 1.1, 2.42, 1.65)]
+        )
+    )
+    assert ratio_treatment["theta"] == pytest.approx(
+        gbstats_compute.pooled_theta_ratio(
+            [ratio_branch(REFERENCE_RECORDS), ratio_branch(TREATMENT_RECORDS)]
+        )
+    )

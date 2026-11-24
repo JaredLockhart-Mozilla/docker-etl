@@ -457,7 +457,9 @@ def enrollment_unit_id(run):
 # ----------------------------------------------------------------------- the source queries ----
 
 
-def build_queries(run, resolved_metrics, sources, cohort_table, unit_segments_table=None):
+def build_queries(
+    run, resolved_metrics, resolved_ratios, sources, cohort_table, unit_segments_table=None
+):
     """One SQL string per (source table, analysis unit) that has something to compute.
 
     Keyed by both, because a run whose experiments randomize on different units reads each source
@@ -465,25 +467,53 @@ def build_queries(run, resolved_metrics, sources, cohort_table, unit_segments_ta
     experiments: a source whose metrics only ever appear at a different unit contributes no group
     for this one, so that (source, unit) pair is skipped rather than scanned for metrics nothing
     there reads. Scoped further still to the experiments that actually select one of this
-    source's metrics (`Run.selecting`), so a source only one recent experiment reads is not read
-    or joined back to the start of an older experiment sharing its unit that never selected it.
-    `sources` is the aggregation plan's resolved source definitions, keyed by the same source
-    names as `resolved_metrics`' own `.source` field.
+    source's metrics or ratios (`Run.selecting`), so a source only one recent experiment reads is
+    not read or joined back to the start of an older experiment sharing its unit that never
+    selected it. `sources` is the aggregation plan's resolved source definitions, keyed by the
+    same source names as `resolved_metrics`' own `.source` field.
+
+    A resolved ratio's numerator and denominator are added to the source's own metrics even when no
+    experiment asked for either by name, since `unit_windows_cte` has to compute their per-unit
+    window values for `ratio_rollup_select` to read, whether or not either is also reported as its
+    own metric. `resolved_ratios` is the whole run's own resolved ratios (`metrics.
+    split_resolved_ratios`), keyed by name the same way `resolved_metrics` is; a ratio is scoped to
+    this (source, unit) pair by its numerator's source, which `split_resolved_ratios` already
+    requires to match the denominator's. `Run.selecting` is passed the ratio's own name alongside
+    its component names, since an experiment's `metric_names` carries the ratio's name, never
+    either component's.
     """
     queries = {}
     for unit, unit_run in run.by_unit().items():
         names = {
             name for experiment in unit_run.experiments for name in experiment.metric_names
         }
-        unit_metrics = {
-            name: metric for name, metric in resolved_metrics.items() if name in names
+        ratio_names = {name for name in names if name in resolved_ratios}
+        component_names = {
+            component
+            for name in ratio_names
+            for component in (
+                resolved_ratios[name].numerator.name,
+                resolved_ratios[name].denominator.name,
+            )
         }
+        unit_metrics = {
+            name: metric
+            for name, metric in resolved_metrics.items()
+            if name in names or name in component_names
+        }
+        unit_ratios = [resolved_ratios[name] for name in ratio_names]
         for source, source_metrics in metrics.group_by_source(unit_metrics).items():
-            source_names = {metric.name for metric in source_metrics}
+            source_ratios = [
+                ratio for ratio in unit_ratios if ratio.numerator.source == source
+            ]
+            source_names = {metric.name for metric in source_metrics} | {
+                ratio.name for ratio in source_ratios
+            }
             queries[f"{source}/{unit.kind}"] = build_source_query(
                 unit_run.selecting(source_names),
                 source,
                 source_metrics,
+                source_ratios,
                 sources[source],
                 cohort_table,
                 unit,
@@ -493,7 +523,7 @@ def build_queries(run, resolved_metrics, sources, cohort_table, unit_segments_ta
 
 
 def build_source_query(
-    run, source, metrics, source_definition, cohort_table, unit, unit_segments_table=None
+    run, source, metrics, ratios, source_definition, cohort_table, unit, unit_segments_table=None
 ):
     """Build the full query for one source: cohort, per-slug facts, rows, stages, rollup.
 
@@ -503,7 +533,9 @@ def build_source_query(
     metric's query byte-identical to before this threshold existed. `unit_segments` is appended the
     same way, only when `run.needs_segments` is true for this unit's own sub-run; otherwise this is
     a dark run (see `Run.needs_segments`) and `unit_windows_cte` builds every row's `segments` array
-    as the bare literal `['all_enrolled']` with no join at all.
+    as the bare literal `['all_enrolled']` with no join at all. `ratios` is this source's own
+    resolved ratios, which `source_rollup` unions in beside the ordinary metric rollup only when it
+    is non-empty, the same way the two CTEs above stay out of a query that does not need them.
     """
     quantiles = reference_quantiles_cte(metrics, run)
     quantiles_block = (
@@ -542,7 +574,7 @@ def build_source_query(
         unit_windows AS (
         {_indent(unit_windows_cte(metrics, needs_segments))}
         ){quantiles_block}
-        {rollup_select(metrics, run)}
+        {source_rollup(metrics, ratios, run)}
     """).strip()
 
 
@@ -1211,6 +1243,123 @@ def rollup_select(metrics, run):
         WHERE {prefix}bucket >= 0
           AND metric_row.window_label IS NOT NULL
         GROUP BY {prefix}slug, {prefix}branch, segment, metric_row.window_label, metric_row.metric
+    """).strip()
+
+
+def _ratio_struct_entry(ratio, rule):
+    """One ratio_row struct literal: its identity and its four raw, unclipped component values.
+
+    Always the bare `unit_windows` columns `unit_windows_cte` already computed for the numerator
+    and denominator as ordinary metrics, never the winsorized form `_clip_fields` would produce:
+    a ratio is never winsorized (see `Ratio`), regardless of either component's own winsorize
+    setting as a standalone metric.
+    """
+    kind = rule["kind"]
+    return (
+        f"STRUCT('{ratio.name}' AS metric, {kind}_window AS window_label, "
+        f"{ratio.numerator.name}__{kind} AS m_post, {ratio.denominator.name}__{kind} AS d_post, "
+        f"{ratio.numerator.name}__pre AS m_pre, {ratio.denominator.name}__pre AS d_pre)"
+    )
+
+
+def ratio_rollup_select(ratios, run):
+    """STAGE C, for ratios: per-branch ratio sufficient statistics, one row per (slug, branch,
+    segment, window, ratio).
+
+    Fifteen numbers per cell rather than the six a mean needs: `n`, the numerator's and
+    denominator's own post-period sum/sum of squares, their post-period cross product, the same
+    three pairs for the pre-enrollment covariate, and the four pre/post cross products between the
+    numerator and denominator. Together these are everything gbstats'
+    `RegressionAdjustedRatioStatistic` needs to fit CUPED and compute the delta-method variance of
+    a ratio (`gbstats_compute.adjusted_ratio`), the same way the six mean statistics feed
+    `RegressionAdjustedStatistic`.
+
+    Shaped to union onto `rollup_select`'s own output (`source_rollup`), so it reads `unit_windows`
+    directly rather than through the `rq`/prefix machinery `rollup_select` needs for winsorization:
+    a ratio is never winsorized, so there is no `reference_quantiles` join to qualify against.
+    """
+    structs = ",\n         ".join(
+        _ratio_struct_entry(ratio, rule) for ratio in ratios for rule in ratio.window_rules
+    )
+    return textwrap.dedent(f"""
+        SELECT
+          slug,
+          branch,
+          segment,
+          metric_row.window_label,
+          metric_row.metric,
+          COUNT(*) AS n,
+          SUM(metric_row.m_post) AS sum_m,
+          SUM(POW(metric_row.m_post, 2)) AS sum_m_squares,
+          SUM(metric_row.d_post) AS sum_d,
+          SUM(POW(metric_row.d_post, 2)) AS sum_d_squares,
+          SUM(CAST(metric_row.m_post AS FLOAT64) * metric_row.d_post) AS sum_m_d,
+          SUM(metric_row.m_pre) AS pre_sum_m,
+          SUM(POW(metric_row.m_pre, 2)) AS pre_sum_m_squares,
+          SUM(metric_row.d_pre) AS pre_sum_d,
+          SUM(POW(metric_row.d_pre, 2)) AS pre_sum_d_squares,
+          SUM(CAST(metric_row.m_pre AS FLOAT64) * metric_row.d_pre) AS pre_sum_m_d,
+          SUM(CAST(metric_row.m_post AS FLOAT64) * metric_row.m_pre) AS sum_m_post_m_pre,
+          SUM(CAST(metric_row.d_post AS FLOAT64) * metric_row.d_pre) AS sum_d_post_d_pre,
+          SUM(CAST(metric_row.m_post AS FLOAT64) * metric_row.d_pre) AS sum_m_post_d_pre,
+          SUM(CAST(metric_row.m_pre AS FLOAT64) * metric_row.d_post) AS sum_m_pre_d_post
+        FROM unit_windows,
+             UNNEST([{structs}]) AS metric_row,
+             UNNEST(unit_windows.segments) AS segment
+        WHERE bucket >= 0
+          AND metric_row.window_label IS NOT NULL
+        GROUP BY slug, branch, segment, metric_row.window_label, metric_row.metric
+    """).strip()
+
+
+def source_rollup(metrics, ratios, run):
+    """The final SELECT for one source: the ordinary per-metric rollup alone, or that rollup
+    unioned with the ratio rollup when this source has a resolved ratio to compute.
+
+    `rollup_select`'s own SQL is returned unchanged when there is no ratio, which is what keeps a
+    source with no ratio metric byte-identical to before ratios existed. Only when `ratios` is
+    non-empty does either side get wrapped, each padded with the other's columns as typed NULL
+    literals so the two sides of the `UNION ALL` line up; a ratio row always carries
+    `winsorize_mode = 'off'` with both thresholds NULL, since a ratio is never winsorized.
+    """
+    base = rollup_select(metrics, run)
+    if not ratios:
+        return base
+    return textwrap.dedent(f"""
+        SELECT
+          base.slug, base.branch, base.segment, base.window_label, base.metric, base.n,
+          base.sum, base.sum_squares, base.pre_sum, base.pre_sum_squares, base.sum_x_pre,
+          base.winsorize_mode, base.post_winsorize_threshold, base.pre_winsorize_threshold,
+          base.clipped_share,
+          CAST(NULL AS FLOAT64) AS sum_m, CAST(NULL AS FLOAT64) AS sum_m_squares,
+          CAST(NULL AS FLOAT64) AS sum_d, CAST(NULL AS FLOAT64) AS sum_d_squares,
+          CAST(NULL AS FLOAT64) AS sum_m_d,
+          CAST(NULL AS FLOAT64) AS pre_sum_m, CAST(NULL AS FLOAT64) AS pre_sum_m_squares,
+          CAST(NULL AS FLOAT64) AS pre_sum_d, CAST(NULL AS FLOAT64) AS pre_sum_d_squares,
+          CAST(NULL AS FLOAT64) AS pre_sum_m_d,
+          CAST(NULL AS FLOAT64) AS sum_m_post_m_pre, CAST(NULL AS FLOAT64) AS sum_d_post_d_pre,
+          CAST(NULL AS FLOAT64) AS sum_m_post_d_pre, CAST(NULL AS FLOAT64) AS sum_m_pre_d_post
+        FROM (
+        {_indent(base)}
+        ) AS base
+        UNION ALL
+        SELECT
+          ratio_rollup.slug, ratio_rollup.branch, ratio_rollup.segment,
+          ratio_rollup.window_label, ratio_rollup.metric, ratio_rollup.n,
+          CAST(NULL AS FLOAT64) AS sum, CAST(NULL AS FLOAT64) AS sum_squares,
+          CAST(NULL AS FLOAT64) AS pre_sum, CAST(NULL AS FLOAT64) AS pre_sum_squares,
+          CAST(NULL AS FLOAT64) AS sum_x_pre,
+          'off' AS winsorize_mode, CAST(NULL AS FLOAT64) AS post_winsorize_threshold,
+          CAST(NULL AS FLOAT64) AS pre_winsorize_threshold, CAST(NULL AS FLOAT64) AS clipped_share,
+          ratio_rollup.sum_m, ratio_rollup.sum_m_squares, ratio_rollup.sum_d,
+          ratio_rollup.sum_d_squares, ratio_rollup.sum_m_d,
+          ratio_rollup.pre_sum_m, ratio_rollup.pre_sum_m_squares, ratio_rollup.pre_sum_d,
+          ratio_rollup.pre_sum_d_squares, ratio_rollup.pre_sum_m_d,
+          ratio_rollup.sum_m_post_m_pre, ratio_rollup.sum_d_post_d_pre,
+          ratio_rollup.sum_m_post_d_pre, ratio_rollup.sum_m_pre_d_post
+        FROM (
+        {_indent(ratio_rollup_select(ratios, run))}
+        ) AS ratio_rollup
     """).strip()
 
 

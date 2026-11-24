@@ -34,7 +34,9 @@ from .metrics import (
     build_aggregation_plan,
     load_metric_hub,
     metrics_for_experiment,
+    ratios_for_experiment,
     split_resolved_metrics,
+    split_resolved_ratios,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,12 +99,18 @@ def run_daily_job(
             return []
 
         configs = load_metric_hub()
-        metrics_by_slug, resolved_metrics, sources = resolve_run_metrics(experiments, configs)
+        (
+            metrics_by_slug, ratios_by_slug, resolved_metrics, resolved_ratios, sources,
+        ) = resolve_run_metrics(experiments, configs)
         segment_names_by_slug, resolved_segments, segment_sources = resolve_run_segments(
             experiments, configs
         )
         windows_by_slug = {
-            experiment.slug: run_windows(experiment, as_of, metrics_by_slug[experiment.slug])
+            experiment.slug: run_windows(
+                experiment,
+                as_of,
+                (*metrics_by_slug[experiment.slug], *ratios_by_slug[experiment.slug]),
+            )
             for experiment in experiments
         }
         run = sql_generation.Run(
@@ -119,7 +127,7 @@ def run_daily_job(
             timings, failure, source_failures,
         ) = gather_sufficient_statistics(
             client, run, resolved_metrics, sources, resolved_segments, segment_sources,
-            segment_names_by_slug, as_of, validate_only,
+            segment_names_by_slug, as_of, validate_only, resolved_ratios,
         )
 
         # No lock: `as_completed` yields in this thread, so the accumulation below is
@@ -138,6 +146,7 @@ def run_daily_job(
                     segment_failures_for_experiment(
                         experiment, segment_names_by_slug, resolved_segments, source_failures
                     ),
+                    ratios_by_slug[experiment.slug],
                 )
                 for experiment in experiments
             ]
@@ -197,6 +206,7 @@ def run_daily_job(
                 run_log,
                 outputs,
                 workers,
+                ratios_by_slug,
             )
         return summaries
 
@@ -220,7 +230,13 @@ def publish_analyses(
     run_log,
     outputs,
     workers,
+    ratios_by_slug=None,
 ):
+    """`ratios_by_slug` defaults to none resolved, which is every run until a parser with
+    `AggregationPlan.ratios` is installed; a resolved ratio is published as one more entry in its
+    experiment's `metrics` list, alongside its ordinary metrics (see `HighwindMetricResult`, which
+    carries nothing ratio-specific)."""
+    ratios_by_slug = ratios_by_slug or {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for experiment in experiments:
             pool.submit(
@@ -231,7 +247,10 @@ def publish_analyses(
                 output_writing.build_analysis,
                 experiment,
                 as_of,
-                metrics_by_slug[experiment.slug],
+                (
+                    *metrics_by_slug[experiment.slug],
+                    *ratios_by_slug.get(experiment.slug, ()),
+                ),
                 results_by_slug.get(experiment.slug, []),
                 cells_by_slug.get(experiment.slug, {}),
                 units_by_slug.get(experiment.slug, {}),
@@ -360,30 +379,41 @@ def writes_blobs(validate_only, sample_percent, outputs):
 
 
 def resolve_run_metrics(experiments, configs):
-    """Resolve the whole run's metrics from metric-hub, once, from every experiment's own names.
+    """Resolve the whole run's metrics and ratios from metric-hub, once, from every experiment's
+    own names.
 
-    Returns each experiment's own metric list (for `run_windows`, the statistics and the blob), the
-    resolved metrics by name (for `sql_generation.build_queries`, which scopes them to each
-    analysis unit's own experiments and groups them by source there), and the plan's source
-    definitions (for the SQL itself). A name that does not resolve, whether metric-hub has no
-    `nimbus/` definition for it or its windows are not ones Highwind can express, is reported
-    against every experiment that asked for it rather than failing the run or that experiment.
+    Returns each experiment's own metric list and own ratio list (for `run_windows`, the
+    statistics and the analysis results), the resolved metrics and ratios by name (for
+    `sql_generation.build_queries`, which scopes them to each analysis unit's own experiments and
+    groups them by source there), and the plan's source definitions (for the SQL itself). A name
+    that does not resolve, whether metric-hub has no `nimbus/` definition for it, its windows are
+    not ones Highwind can express, or (for a ratio) its numerator and denominator read different
+    sources or declare different windows, is reported against every experiment that asked for it
+    rather than failing the run or that experiment.
     """
     requested = {name for experiment in experiments for name in experiment.metric_names}
     plan = build_aggregation_plan(configs, requested)
     resolved_metrics, unresolved_metrics = split_resolved_metrics(plan)
-    metrics_by_slug = {}
+    resolved_ratios, unresolved_ratios = split_resolved_ratios(
+        plan, resolved_metrics, unresolved_metrics
+    )
+    ratio_names = {*resolved_ratios, *unresolved_ratios}
+    metrics_by_slug, ratios_by_slug = {}, {}
     for experiment in experiments:
-        exp_metrics, problems = metrics_for_experiment(
-            experiment, resolved_metrics, unresolved_metrics
+        exp_metrics, metric_problems = metrics_for_experiment(
+            experiment, resolved_metrics, unresolved_metrics, ratio_names
+        )
+        exp_ratios, ratio_problems = ratios_for_experiment(
+            experiment, resolved_ratios, unresolved_ratios
         )
         metrics_by_slug[experiment.slug] = exp_metrics
-        for problem in problems:
+        ratios_by_slug[experiment.slug] = exp_ratios
+        for problem in (*metric_problems, *ratio_problems):
             logger.warning(
                 f"{experiment.slug}: metric {problem.name!r} not computed: {problem.reason}",
                 extra={"experiment_slug": experiment.slug, "metric": problem.name},
             )
-    return metrics_by_slug, resolved_metrics, plan.sources
+    return metrics_by_slug, ratios_by_slug, resolved_metrics, resolved_ratios, plan.sources
 
 
 def resolve_run_segments(experiments, configs):
@@ -417,7 +447,7 @@ def resolve_run_segments(experiments, configs):
 
 def gather_sufficient_statistics(
     client, run, resolved_metrics, sources, resolved_segments, segment_sources,
-    segment_names_by_slug, as_of, validate_only,
+    segment_names_by_slug, as_of, validate_only, resolved_ratios=None,
 ):
     """Run the shared scan: cohort once, each resolved segment source's own flags once, then one
     query per (source, unit) pair with something to compute, split by slug.
@@ -426,8 +456,10 @@ def gather_sufficient_statistics(
     unchanged (a segment whose source failed still carries its name; its own failure shows on its
     cells instead, via the last item), the timings, whatever made the whole shared scan fail
     (`None` on a normal run, recorded as an error grid on every experiment), and the segment
-    sources that failed to materialize, by (source, analysis unit).
+    sources that failed to materialize, by (source, analysis unit). `resolved_ratios` defaults to
+    none resolved, which is every run until a parser with `AggregationPlan.ratios` is installed.
     """
+    resolved_ratios = resolved_ratios or {}
     if not run.experiments:
         return {}, {}, {}, segment_names_by_slug, [], None, {}
     try:
@@ -438,7 +470,7 @@ def gather_sufficient_statistics(
             client, run, resolved_segments, segment_sources, cohort_table, as_of, validate_only
         )
         queries = sql_generation.build_queries(
-            run, resolved_metrics, sources, cohort_table, unit_segments_table
+            run, resolved_metrics, resolved_ratios, sources, cohort_table, unit_segments_table
         )
         cells_by_slug, timings = sql_running.run_queries(
             client, queries, validate_only=validate_only
@@ -593,28 +625,31 @@ def report_progress(summary, done, total):
 
 
 def analyze_experiment(
-    experiment, windows, metrics, cells, shared_failure, segment_names=(discovery.ALL_ENROLLED,),
-    segment_failures=None,
+    experiment, windows, metrics, cells, shared_failure,
+    segment_names=(discovery.ALL_ENROLLED,), segment_failures=None, ratios=(),
 ):
     """One experiment's statistics, from cells the shared scan already produced.
 
     Wrapped so a failure is recorded against this experiment's cells and the loop continues. The
     unit of isolation is the experiment because that is the unit a user reads: one experiment whose
-    statistics blow up should not cost the others their results. `metrics` is this experiment's own
-    resolved list, not the run's full set: two experiments can ask for different metrics.
-    `segment_names` is this experiment's own full segment set, `all_enrolled` first, the same way.
-    `segment_failures` maps one of those names to the error its own data source hit, so that
-    segment's cells record it instead of reading as `not_started`.
+    statistics blow up should not cost the others their results. `metrics` and `ratios` are this
+    experiment's own resolved lists, not the run's full sets: two experiments can ask for different
+    metrics. `ratios` defaults to none, which is every experiment until a parser with
+    `AggregationPlan.ratios` is installed. `segment_names` is this experiment's own full segment
+    set, `all_enrolled` first, the same way. `segment_failures` maps one of those names to the error
+    its own data source hit, so that segment's cells record it instead of reading as `not_started`.
     """
     try:
         if shared_failure is not None:
-            return failed_summary(experiment, windows, metrics, segment_names, shared_failure)
+            return failed_summary(
+                experiment, windows, (*metrics, *ratios), segment_names, shared_failure
+            )
         if not windows:
             # Younger than the shortest window, so no unit has completed one and there is nothing
             # to compute. Its cells are all `not_started` by construction.
             return experiment_summary(experiment, []), []
         results = gbstats_compute.compute_statistics(
-            experiment, metrics, windows, cells, segments=segment_names,
+            experiment, (*metrics, *ratios), windows, cells, segments=segment_names,
             segment_failures=segment_failures,
         )
         return experiment_summary(experiment, results), results
@@ -626,7 +661,9 @@ def analyze_experiment(
             f"{experiment.slug} failed", extra={"experiment_slug": experiment.slug}
         )
         try:
-            return failed_summary(experiment, windows, metrics, segment_names, error)
+            return failed_summary(
+                experiment, windows, (*metrics, *ratios), segment_names, error
+            )
         except Exception as while_recording:
             # A failure while recording a failure must not propagate: it would come back out of
             # future.result() and cost every other experiment its results, which is exactly the
@@ -650,7 +687,8 @@ def failed_summary(experiment, windows, metrics, segment_names, error):
 
     Without this the error rate cannot see an outage: an experiment that produced nothing would
     write no rows and so contribute nothing to the denominator, making total failure look like
-    perfect health.
+    perfect health. `metrics` already carries both the experiment's metrics and its ratios, combined
+    by the caller (`analyze_experiment`).
     """
     results = gbstats_compute.compute_statistics(
         experiment, metrics, windows, cells={}, failure=error, segments=segment_names

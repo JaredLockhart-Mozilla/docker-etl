@@ -213,12 +213,18 @@ def query_timing(source, job, rows, wall_seconds):
 
 
 def sufficient_stats(row):
-    """One cell's six aggregates, as floats with an integer count, plus how it was winsorized.
+    """One cell's aggregates, as floats with an integer count, plus how it was winsorized.
 
-    The winsorize columns are nullable rather than defaulted like the six aggregates above: NULL
-    is itself meaningful here (no threshold applied, for an OFF metric or a skipped-too-few
-    window), where a NULL aggregate would only ever mean a BigQuery NULL arithmetic result this
-    job already treats as zero.
+    The winsorize columns are nullable rather than defaulted like the mean aggregates: NULL is
+    itself meaningful here (no threshold applied, for an OFF metric or a skipped-too-few window),
+    where a NULL mean aggregate would only ever mean a BigQuery NULL arithmetic result this job
+    already treats as zero.
+
+    The fourteen ratio sufficient statistics beyond `n` (`_nullable_float`) are nullable the same
+    way: a source with no resolved ratio never selects them at all, so `row.get` reads them as the
+    column simply being absent; a source with both a ratio and mean metrics selects them for every
+    row via `sql_generation.source_rollup`'s `UNION ALL`, so a mean cell's row carries them as an
+    explicit NULL instead.
     """
     return {
         "n": int(row["n"]),
@@ -231,4 +237,23 @@ def sufficient_stats(row):
         "post_winsorize_threshold": row["post_winsorize_threshold"],
         "pre_winsorize_threshold": row["pre_winsorize_threshold"],
         "clipped_share": row["clipped_share"],
+        "sum_m": _nullable_float(row, "sum_m"),
+        "sum_m_squares": _nullable_float(row, "sum_m_squares"),
+        "sum_d": _nullable_float(row, "sum_d"),
+        "sum_d_squares": _nullable_float(row, "sum_d_squares"),
+        "sum_m_d": _nullable_float(row, "sum_m_d"),
+        "pre_sum_m": _nullable_float(row, "pre_sum_m"),
+        "pre_sum_m_squares": _nullable_float(row, "pre_sum_m_squares"),
+        "pre_sum_d": _nullable_float(row, "pre_sum_d"),
+        "pre_sum_d_squares": _nullable_float(row, "pre_sum_d_squares"),
+        "pre_sum_m_d": _nullable_float(row, "pre_sum_m_d"),
+        "sum_m_post_m_pre": _nullable_float(row, "sum_m_post_m_pre"),
+        "sum_d_post_d_pre": _nullable_float(row, "sum_d_post_d_pre"),
+        "sum_m_post_d_pre": _nullable_float(row, "sum_m_post_d_pre"),
+        "sum_m_pre_d_post": _nullable_float(row, "sum_m_pre_d_post"),
     }
+
+
+def _nullable_float(row, column):
+    value = row.get(column)
+    return None if value is None else float(value)

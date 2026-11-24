@@ -20,9 +20,14 @@ from gbstats.messages import (
     BASELINE_VARIATION_ZERO_MESSAGE,
     ZERO_NEGATIVE_VARIANCE_MESSAGE,
 )
-from gbstats.models.statistics import RegressionAdjustedStatistic, SampleMeanStatistic
+from gbstats.models.statistics import (
+    RegressionAdjustedRatioStatistic,
+    RegressionAdjustedStatistic,
+    SampleMeanStatistic,
+)
 
 from . import discovery
+from .metrics import Ratio
 
 logger = logging.getLogger(__name__)
 
@@ -100,12 +105,18 @@ def window_theta(experiment, metric, window, cells, segment=discovery.ALL_ENROLL
     on the whole cohort rather than on a fraction of it, and keeps it independent of which pair is
     being read, which is what stops the adjustment being a function of the contrast it is meant to
     sharpen.
+
+    A ratio's slope is fitted the same way, pooled over branches, but from
+    `pooled_theta_ratio`'s delta-method quantities rather than `pooled_theta`'s raw sums: a ratio's
+    covariate is itself a ratio, so there is no single pre-period scalar to pool directly.
     """
     reported = [
         cells[(metric.name, window.label, segment, branch)]
         for branch in experiment.branches
         if (metric.name, window.label, segment, branch) in cells
     ]
+    if isinstance(metric, Ratio):
+        return pooled_theta_ratio(reported)
     return pooled_theta(reported)
 
 
@@ -137,7 +148,11 @@ def compute_cell(experiment, metric, window, segment, treatment, cells, theta, f
         )
 
     try:
-        interval = sequential_interval(reference, candidate, theta)
+        interval = (
+            sequential_interval_ratio(reference, candidate, theta)
+            if isinstance(metric, Ratio)
+            else sequential_interval(reference, candidate, theta)
+        )
     except Exception as error:  # the state IS the error classification
         logger.exception(
             f"{experiment.slug} {metric.name} {window.label} {treatment} failed",
@@ -179,6 +194,29 @@ def sequential_interval(reference, treatment, theta):
     """
     reference_statistic = adjusted(reference, theta)
     treatment_statistic = adjusted(treatment, theta)
+    return finalize_interval(reference_statistic, treatment_statistic, theta)
+
+
+def sequential_interval_ratio(reference, treatment, theta):
+    """`sequential_interval`'s ratio counterpart: the same always-valid relative interval, built
+    from `RegressionAdjustedRatioStatistic` instead of `RegressionAdjustedStatistic`.
+
+    gbstats' sequential test does not special-case a ratio (see `finalize_interval`): everything
+    ratio-specific is in how the statistic itself is built (`adjusted_ratio`) and in its own
+    delta-method `variance`.
+    """
+    reference_statistic = adjusted_ratio(reference, theta)
+    treatment_statistic = adjusted_ratio(treatment, theta)
+    return finalize_interval(reference_statistic, treatment_statistic, theta)
+
+
+def finalize_interval(reference_statistic, treatment_statistic, theta):
+    """Run the sequential test on one pair of already-adjusted statistics and shape its result.
+
+    Shared by `sequential_interval` and `sequential_interval_ratio`: once the two statistics are
+    built, gbstats' own test and result shape are generic over a mean or a ratio alike (see
+    `gbstats.models.tests.create_theta_adjusted_statistics`, which has its own branch for each).
+    """
     result = build_t_test(reference_statistic, treatment_statistic).compute_result()
     if result.errorMessage and result.errorMessage not in UNESTIMABLE_MESSAGES:
         raise GbstatsError(result.errorMessage)
@@ -210,6 +248,19 @@ def relative_denominator(reference_statistic):
 
 def mean_halfwidth(cell, theta):
     statistic = adjusted(cell, theta)
+    if statistic.variance < 0:
+        return math.nan
+    return sequential_interval_halfwidth(
+        statistic.variance,
+        statistic.n,
+        tuning_parameter(statistic.n),
+        SequentialConfig().alpha,
+    )
+
+
+def ratio_halfwidth(cell, theta):
+    """`mean_halfwidth`'s ratio counterpart, from the delta-method variance of a ratio statistic."""
+    statistic = adjusted_ratio(cell, theta)
     if statistic.variance < 0:
         return math.nan
     return sequential_interval_halfwidth(
@@ -292,6 +343,34 @@ def pooled_theta(branches):
     return covariance / pre_variance
 
 
+def pooled_theta_ratio(branches):
+    """`pooled_theta`'s ratio analogue: the same group's-one-theta pooling, from gbstats' own
+    two-branch `compute_theta_regression_adjusted_ratio` generalised to every branch that reported.
+
+    gbstats fits a ratio's theta from a PAIR, `-(a.covariance + b.covariance) / (a.var_pre +
+    b.var_pre)`, each term a delta-method quantity computed from that one branch's own statistic at
+    `theta=1` (not a raw-sum pool like `pooled_theta`'s mean case, since a ratio's covariate is
+    itself a ratio with no single pre-period scalar to sum first). Summing those same per-branch
+    terms over every reporting branch, rather than just the two in a pair, is what pools the slope
+    across a multi-arm experiment the way `pooled_theta` does for a mean: with exactly two branches
+    this returns the same value gbstats' own two-branch formula would.
+
+    Falls back to no adjustment when the pooled pre-period variance is zero or negative, rather than
+    dividing by zero: `var_pre_total` is a sum of quadratic forms that is mathematically
+    non-negative, but it is built the same sums-of-squares-minus-a-mean-square shape as
+    `pooled_theta`'s own `pre_variance`, so a near-zero pre-period variance can round fractionally
+    negative the same way, and the `<= 0` guard here matches `pooled_theta`'s for that reason.
+    """
+    if sum(branch["n"] for branch in branches) < 2:
+        return 0.0
+    statistics = [adjusted_ratio(branch, theta=1) for branch in branches]
+    var_pre_total = sum(statistic.var_pre for statistic in statistics)
+    if var_pre_total <= 0:
+        return 0.0
+    covariance_total = sum(statistic.covariance for statistic in statistics)
+    return -covariance_total / var_pre_total
+
+
 def adjusted(cell, theta):
     """One branch's sufficient statistics as a CUPED-adjusted sample mean.
 
@@ -307,6 +386,38 @@ def adjusted(cell, theta):
             n=cell["n"], sum=cell["pre_sum"], sum_squares=cell["pre_sum_squares"]
         ),
         post_pre_sum_of_products=cell["sum_x_pre"],
+        theta=theta,
+    )
+
+
+def adjusted_ratio(cell, theta):
+    """One branch's ratio sufficient statistics as a CUPED-adjusted ratio statistic.
+
+    The fifteen numbers `sql_generation.ratio_rollup_select` computes are exactly what
+    `RegressionAdjustedRatioStatistic` needs: a `SampleMeanStatistic` for each of the numerator's
+    and denominator's post- and pre-period sums, and the six cross products of post/pre and
+    numerator/denominator that its delta-method variance and `theta` fit are built from.
+    """
+    return RegressionAdjustedRatioStatistic(
+        n=cell["n"],
+        m_statistic_post=SampleMeanStatistic(
+            n=cell["n"], sum=cell["sum_m"], sum_squares=cell["sum_m_squares"]
+        ),
+        d_statistic_post=SampleMeanStatistic(
+            n=cell["n"], sum=cell["sum_d"], sum_squares=cell["sum_d_squares"]
+        ),
+        m_statistic_pre=SampleMeanStatistic(
+            n=cell["n"], sum=cell["pre_sum_m"], sum_squares=cell["pre_sum_m_squares"]
+        ),
+        d_statistic_pre=SampleMeanStatistic(
+            n=cell["n"], sum=cell["pre_sum_d"], sum_squares=cell["pre_sum_d_squares"]
+        ),
+        m_post_m_pre_sum_of_products=cell["sum_m_post_m_pre"],
+        d_post_d_pre_sum_of_products=cell["sum_d_post_d_pre"],
+        m_pre_d_pre_sum_of_products=cell["pre_sum_m_d"],
+        m_post_d_post_sum_of_products=cell["sum_m_d"],
+        m_post_d_pre_sum_of_products=cell["sum_m_post_d_pre"],
+        m_pre_d_post_sum_of_products=cell["sum_m_pre_d_post"],
         theta=theta,
     )
 

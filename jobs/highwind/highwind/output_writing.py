@@ -42,7 +42,7 @@ from mozilla_nimbus_schemas.highwind import (
 )
 
 from . import discovery, gbstats_compute
-from .metrics import WinsorizeMode
+from .metrics import Ratio, WinsorizeMode
 
 # The job's own winsorize_mode strings (sql_generation.py's _clip_fields, carried through
 # sql_running.sufficient_stats) onto the blob schema's enum. Not a 1:1 name match: the job's
@@ -340,6 +340,86 @@ SUFFICIENT_STATS_SCHEMA = [
             "Share of this branch's own matured units whose post-enrollment value exceeded "
             "post_winsorize_threshold and so was reduced to it. 0 when winsorize_mode is off or "
             "skipped_too_few."
+        ),
+    ),
+    bigquery.SchemaField(
+        "sum_m",
+        "FLOAT64",
+        description=(
+            "A ratio metric's numerator, summed over this window. NULL for a non-ratio metric."
+        ),
+    ),
+    bigquery.SchemaField(
+        "sum_m_squares",
+        "FLOAT64",
+        description="Sum of squares of the same per-unit numerator values.",
+    ),
+    bigquery.SchemaField(
+        "sum_d",
+        "FLOAT64",
+        description="A ratio metric's denominator, summed over this window.",
+    ),
+    bigquery.SchemaField(
+        "sum_d_squares",
+        "FLOAT64",
+        description="Sum of squares of the same per-unit denominator values.",
+    ),
+    bigquery.SchemaField(
+        "sum_m_d",
+        "FLOAT64",
+        description="Sum of products of the per-unit numerator and denominator values.",
+    ),
+    bigquery.SchemaField(
+        "pre_sum_m",
+        "FLOAT64",
+        description="The numerator's own covariate, summed over the pre-enrollment window.",
+    ),
+    bigquery.SchemaField(
+        "pre_sum_m_squares",
+        "FLOAT64",
+        description="Sum of squares of the numerator's covariate.",
+    ),
+    bigquery.SchemaField(
+        "pre_sum_d",
+        "FLOAT64",
+        description="The denominator's own covariate, summed over the pre-enrollment window.",
+    ),
+    bigquery.SchemaField(
+        "pre_sum_d_squares",
+        "FLOAT64",
+        description="Sum of squares of the denominator's covariate.",
+    ),
+    bigquery.SchemaField(
+        "pre_sum_m_d",
+        "FLOAT64",
+        description="Sum of products of the numerator's and denominator's covariates.",
+    ),
+    bigquery.SchemaField(
+        "sum_m_post_m_pre",
+        "FLOAT64",
+        description="Sum of products of the numerator's post-enrollment value and its covariate.",
+    ),
+    bigquery.SchemaField(
+        "sum_d_post_d_pre",
+        "FLOAT64",
+        description=(
+            "Sum of products of the denominator's post-enrollment value and its covariate."
+        ),
+    ),
+    bigquery.SchemaField(
+        "sum_m_post_d_pre",
+        "FLOAT64",
+        description=(
+            "Sum of products of the numerator's post-enrollment value and the denominator's "
+            "covariate."
+        ),
+    ),
+    bigquery.SchemaField(
+        "sum_m_pre_d_post",
+        "FLOAT64",
+        description=(
+            "Sum of products of the numerator's covariate and the denominator's post-enrollment "
+            "value."
         ),
     ),
 ]
@@ -664,21 +744,40 @@ def build_branches(experiment, metric, window, cells, comparisons, segment):
 
 
 def branch_means(experiment, metric, window, cells, segment):
+    """Each branch's own CUPED-adjusted point estimate, recentred by the pooled covariate so a
+    branch with no real shift from the others displays close to its own raw value.
+
+    A ratio's covariate is itself a ratio (`pre_sum_m / pre_sum_d`), so its pooled recentring term
+    is the pooled ratio of those two sums rather than a single pooled mean; `branch_mean_ratio`
+    reads it the same way `branch_mean` reads `pooled_pre_mean`.
+    """
     reported = [
         cells[(metric.name, window.label, segment, branch)]
         for branch in experiment.branches
         if (metric.name, window.label, segment, branch) in cells
     ]
+    is_ratio = isinstance(metric, Ratio)
     try:
         theta = gbstats_compute.window_theta(experiment, metric, window, cells, segment)
-        pooled_pre_mean = sum(cell["pre_sum"] for cell in reported) / sum(
-            cell["n"] for cell in reported
-        )
+        if is_ratio:
+            pooled_pre = sum(cell["pre_sum_m"] for cell in reported) / sum(
+                cell["pre_sum_d"] for cell in reported
+            )
+        else:
+            pooled_pre = sum(cell["pre_sum"] for cell in reported) / sum(
+                cell["n"] for cell in reported
+            )
     except Exception:
         return {branch: empty_interval() for branch in experiment.branches}
     return {
-        branch: branch_mean(
-            cells.get((metric.name, window.label, segment, branch)), theta, pooled_pre_mean
+        branch: (
+            branch_mean_ratio(
+                cells.get((metric.name, window.label, segment, branch)), theta, pooled_pre
+            )
+            if is_ratio
+            else branch_mean(
+                cells.get((metric.name, window.label, segment, branch)), theta, pooled_pre
+            )
         )
         for branch in experiment.branches
     }
@@ -690,6 +789,22 @@ def branch_mean(cell, theta, pooled_pre_mean):
     try:
         mean = cell["sum"] / cell["n"] - theta * (cell["pre_sum"] / cell["n"] - pooled_pre_mean)
         halfwidth = gbstats_compute.mean_halfwidth(cell, theta)
+    except Exception:
+        return empty_interval()
+    if not (math.isfinite(mean) and math.isfinite(halfwidth)):
+        return empty_interval()
+    return HighwindInterval(point=mean, lower=mean - halfwidth, upper=mean + halfwidth)
+
+
+def branch_mean_ratio(cell, theta, pooled_pre_ratio):
+    """`branch_mean`'s ratio counterpart: this branch's own CUPED-adjusted ratio, recentred by the
+    pooled ratio of the covariate's numerator and denominator rather than a single pooled mean."""
+    if cell is None or cell["n"] < gbstats_compute.MIN_UNITS:
+        return empty_interval()
+    try:
+        statistic = gbstats_compute.adjusted_ratio(cell, theta)
+        mean = statistic.mean_post - theta * (statistic.mean_pre - pooled_pre_ratio)
+        halfwidth = gbstats_compute.ratio_halfwidth(cell, theta)
     except Exception:
         return empty_interval()
     if not (math.isfinite(mean) and math.isfinite(halfwidth)):

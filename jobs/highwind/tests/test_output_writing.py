@@ -13,7 +13,7 @@ from gbstats.frequentist.tests import sequential_interval_halfwidth
 
 from highwind import discovery, gbstats_compute, output_writing, units
 from highwind.discovery import Experiment
-from highwind.metrics import CUMULATIVE_WEEKLY, DISJOINT_WEEKLY, Metric
+from highwind.metrics import CUMULATIVE_WEEKLY, DISJOINT_WEEKLY, Metric, Ratio
 
 AS_OF = datetime.date(2026, 8, 1)
 
@@ -1116,6 +1116,189 @@ def test_an_errored_comparison_leaves_its_branch_without_a_value():
         ("control", None),
         ("treatment", None),
     ]
+
+
+RATIO_METRIC = Ratio(
+    name="ad_click_rate",
+    numerator=Metric(name="ad_clicks", source="newtab", reducer=None, window_rules=()),
+    denominator=Metric(name="search_count", source="newtab", reducer=None, window_rules=()),
+    window_rules=(CUMULATIVE_WEEKLY,),
+    friendly_name="Ad click rate",
+)
+
+
+def ratio_cell_from_records(records, winsorize_mode="off"):
+    """One branch's ratio sufficient-stats cell, summed from explicit per-unit
+    (m_post, d_post, m_pre, d_pre) tuples, the same shape `sql_generation.ratio_rollup_select`
+    produces."""
+    return dict(
+        n=len(records),
+        sum_m=sum(m_post for m_post, d_post, m_pre, d_pre in records),
+        sum_m_squares=sum(m_post**2 for m_post, d_post, m_pre, d_pre in records),
+        sum_d=sum(d_post for m_post, d_post, m_pre, d_pre in records),
+        sum_d_squares=sum(d_post**2 for m_post, d_post, m_pre, d_pre in records),
+        sum_m_d=sum(m_post * d_post for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_m=sum(m_pre for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_m_squares=sum(m_pre**2 for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_d=sum(d_pre for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_d_squares=sum(d_pre**2 for m_post, d_post, m_pre, d_pre in records),
+        pre_sum_m_d=sum(m_pre * d_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_m_post_m_pre=sum(m_post * m_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_d_post_d_pre=sum(d_post * d_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_m_post_d_pre=sum(m_post * d_pre for m_post, d_post, m_pre, d_pre in records),
+        sum_m_pre_d_post=sum(m_pre * d_post for m_post, d_post, m_pre, d_pre in records),
+        winsorize_mode=winsorize_mode,
+        post_winsorize_threshold=None,
+        pre_winsorize_threshold=None,
+        clipped_share=None,
+    )
+
+
+# Constant pre values across units: no pre-period variance, so theta is always zero regardless of
+# the post-period records, the same trick `unit_cell` uses for the plain-mean tests above.
+NO_COVARIATE_RECORDS = [(2, 10, 1, 1), (3, 11, 1, 1), (1, 9, 1, 1), (4, 12, 1, 1)]
+VARYING_COVARIATE_RECORDS = [
+    (2, 10, 1, 9), (3, 11, 2, 10), (1, 9, 0, 8), (4, 12, 3, 11), (2, 9, 1, 8),
+    (5, 13, 2, 11), (0, 8, 0, 7), (3, 10, 1, 9), (4, 11, 3, 10), (1, 9, 1, 8),
+]
+
+
+def test_a_ratio_branch_value_is_its_ratio_of_sums_when_the_covariate_carries_no_adjustment():
+    analysis = build(
+        experiment=THREE_ARMS,
+        metrics=[RATIO_METRIC],
+        results=[
+            result("ad_click_rate", 1, "cumulative", "forming", branch=branch, point=1.0,
+                   lower=-1.0, upper=3.0)
+            for branch in ("treatment-a", "treatment-b")
+        ],
+        cells={
+            ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+            ("ad_click_rate", "cumu:1", "all_enrolled", "treatment-a"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+        },
+    )
+
+    sums = [m_post for m_post, d_post, m_pre, d_pre in NO_COVARIATE_RECORDS]
+    denominators = [d_post for m_post, d_post, m_pre, d_pre in NO_COVARIATE_RECORDS]
+    expected = sum(sums) / sum(denominators)
+    values = values_of(windows_of(analysis, "ad_click_rate")[0])
+    assert values[0] == ("control", pytest.approx(expected))
+    assert values[1] == ("treatment-a", pytest.approx(expected))
+    assert values[2] == ("treatment-b", None)
+
+
+def test_a_ratio_branch_value_is_adjusted_then_recentred_by_the_pooled_covariate_ratio():
+    # Both branches share the exact same cell, so whatever theta is fitted, the recentring by the
+    # pooled pre-period ratio must cancel it out and leave each branch at its own raw ratio.
+    cell = ratio_cell_from_records(VARYING_COVARIATE_RECORDS)
+    analysis = build(
+        metrics=[RATIO_METRIC],
+        results=[result("ad_click_rate", 1, "cumulative", "forming", point=0.0, lower=-1.0,
+                        upper=1.0)],
+        cells={
+            ("ad_click_rate", "cumu:1", "all_enrolled", "control"): cell,
+            ("ad_click_rate", "cumu:1", "all_enrolled", "treatment"): cell,
+        },
+    )
+
+    sums = [m_post for m_post, d_post, m_pre, d_pre in VARYING_COVARIATE_RECORDS]
+    denominators = [d_post for m_post, d_post, m_pre, d_pre in VARYING_COVARIATE_RECORDS]
+    expected = sum(sums) / sum(denominators)
+    [(_, reference), (_, treatment)] = values_of(windows_of(analysis, "ad_click_rate")[0])
+    assert reference == pytest.approx(expected)
+    assert treatment == pytest.approx(expected)
+
+
+def test_a_ratio_window_records_winsorization_as_off():
+    analysis = build(
+        metrics=[RATIO_METRIC],
+        results=[result("ad_click_rate", 1, "cumulative", "forming", point=0.0, lower=-1.0,
+                        upper=1.0)],
+        cells={
+            ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+            ("ad_click_rate", "cumu:1", "all_enrolled", "treatment"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+        },
+    )
+
+    window = windows_of(analysis, "ad_click_rate")[0]
+    assert window.winsorize_mode == HighwindWinsorizeMode.OFF
+    assert window.post_winsorize_threshold is None
+    assert window.pre_winsorize_threshold is None
+
+
+def test_build_analysis_reports_a_ratio_metric_like_any_other():
+    analysis = build(
+        metrics=[RATIO_METRIC],
+        results=[result("ad_click_rate", 1, "cumulative", "forming", point=2.0, lower=-1.0,
+                        upper=5.0)],
+        cells={
+            ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+            ("ad_click_rate", "cumu:1", "all_enrolled", "treatment"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+        },
+    )
+
+    assert [metric.slug for metric in analysis.metrics] == ["ad_click_rate"]
+    assert analysis.metrics[0].friendly_name == "Ad click rate"
+    comparisons = windows_of(analysis, "ad_click_rate")[0].comparisons
+    assert comparisons[0].relative.point == 2.0
+
+
+def test_build_analysis_reports_an_ordinary_metric_and_a_ratio_together():
+    # The real case once a ratio ships: an experiment's own metrics list mixes its ordinary
+    # guardrails with a ratio, built in one build_analysis call. Each must come out with its own
+    # friendly name and its own branch values, with no cross-talk between the two.
+    analysis = build(
+        experiment=THREE_ARMS,
+        metrics=[CUMULATIVE_METRIC, RATIO_METRIC],
+        results=[
+            result("active_hours", 1, "cumulative", "forming", branch=branch, point=1.0,
+                   lower=-1.0, upper=3.0)
+            for branch in ("treatment-a", "treatment-b")
+        ]
+        + [
+            result("ad_click_rate", 1, "cumulative", "forming", branch=branch, point=2.0,
+                   lower=-1.0, upper=5.0)
+            for branch in ("treatment-a", "treatment-b")
+        ],
+        cells={
+            ("active_hours", "cumu:1", "all_enrolled", "control"): unit_cell(100, 2.0),
+            ("active_hours", "cumu:1", "all_enrolled", "treatment-a"): unit_cell(100, 3.0),
+            ("ad_click_rate", "cumu:1", "all_enrolled", "control"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+            ("ad_click_rate", "cumu:1", "all_enrolled", "treatment-a"): ratio_cell_from_records(
+                NO_COVARIATE_RECORDS
+            ),
+        },
+    )
+
+    assert {metric.slug for metric in analysis.metrics} == {"active_hours", "ad_click_rate"}
+    by_slug = {metric.slug: metric for metric in analysis.metrics}
+    assert by_slug["active_hours"].friendly_name == "Active hours"
+    assert by_slug["ad_click_rate"].friendly_name == "Ad click rate"
+    assert values_of(windows_of(analysis, "active_hours")[0]) == [
+        ("control", 2.0),
+        ("treatment-a", 3.0),
+        ("treatment-b", None),
+    ]
+    sums = [m_post for m_post, d_post, m_pre, d_pre in NO_COVARIATE_RECORDS]
+    denominators = [d_post for m_post, d_post, m_pre, d_pre in NO_COVARIATE_RECORDS]
+    expected_ratio = sum(sums) / sum(denominators)
+    ratio_values = values_of(windows_of(analysis, "ad_click_rate")[0])
+    assert ratio_values[0] == ("control", pytest.approx(expected_ratio))
+    assert ratio_values[1] == ("treatment-a", pytest.approx(expected_ratio))
 
 
 def test_a_window_that_has_not_matured_has_no_branch_values():

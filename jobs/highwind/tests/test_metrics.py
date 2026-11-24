@@ -4,7 +4,11 @@ import types
 
 import pytest
 from metric_config_parser.aggregation import BucketedAggregation, Combine
-from metric_config_parser.aggregation_plan import AggregationMetric, AggregationPlan
+from metric_config_parser.aggregation_plan import (
+    AggregationMetric,
+    AggregationPlan,
+    AggregationRatio,
+)
 
 from highwind import metrics, sql_generation
 from highwind.discovery import Experiment, MetricDisplay
@@ -261,6 +265,21 @@ def test_for_experiment_reports_a_name_it_asked_for_that_did_not_resolve():
     assert "no nimbus/ definition" in problems[0].reason
 
 
+def test_for_experiment_skips_a_name_that_resolved_as_a_ratio():
+    # A ratio's own name is deliberately absent from both resolved_metrics and
+    # unresolved_metrics (the parser resolves it into plan.ratios instead); without `ratio_names`
+    # this would default to "no nimbus/ definition for this app" on top of whatever
+    # ratios_for_experiment already reports for it.
+    experiment = experiment_with(["ad_click_rate"])
+
+    chosen, problems = metrics.metrics_for_experiment(
+        experiment, {}, {}, ratio_names={"ad_click_rate"}
+    )
+
+    assert chosen == []
+    assert problems == []
+
+
 # ------------------------------------------------------------------------- winsorization ----
 
 
@@ -441,3 +460,218 @@ def test_a_yes_no_metric_is_never_clipped_even_with_a_threshold_set():
     setting = metrics.winsorize_mode(metric_with(is_yes_no=True, winsorize_threshold=500))
 
     assert setting == metrics.Winsorize(metrics.WinsorizeMode.OFF)
+
+
+def ratio_metric(name, source):
+    return metrics.Metric(
+        name=name, source=source, reducer=REDUCER, window_rules=(metrics.CUMULATIVE_WEEKLY,)
+    )
+
+
+def plan_with_ratios(ratios_by_name, metrics_by_name=None):
+    return AggregationPlan(
+        sources={}, metrics=metrics_by_name or {}, ratios=ratios_by_name, missing=[]
+    )
+
+
+def aggregation_ratio(name, numerator, denominator):
+    return AggregationRatio(name=name, numerator=numerator, denominator=denominator)
+
+
+def test_split_resolved_ratios_builds_a_ratio_from_its_resolved_components():
+    plan = plan_with_ratios(
+        {"ad_click_rate": aggregation_ratio("ad_click_rate", "ad_clicks", "search_count")}
+    )
+    resolved_metrics = {
+        "ad_clicks": ratio_metric("ad_clicks", "newtab"),
+        "search_count": ratio_metric("search_count", "newtab"),
+    }
+
+    resolved, unresolved = metrics.split_resolved_ratios(plan, resolved_metrics, {})
+
+    assert unresolved == {}
+    ratio = resolved["ad_click_rate"]
+    assert ratio.name == "ad_click_rate"
+    assert ratio.numerator.name == "ad_clicks"
+    assert ratio.denominator.name == "search_count"
+    assert ratio.window_rules == (metrics.CUMULATIVE_WEEKLY,)
+
+
+def test_a_ratio_whose_numerator_did_not_resolve_is_reported_unresolved():
+    plan = plan_with_ratios(
+        {"ad_click_rate": aggregation_ratio("ad_click_rate", "ad_clicks", "search_count")}
+    )
+    resolved_metrics = {"search_count": ratio_metric("search_count", "newtab")}
+    unresolved_metrics = {"ad_clicks": "cumulative_window is 10 days, not a multiple of 7"}
+
+    resolved, unresolved = metrics.split_resolved_ratios(
+        plan, resolved_metrics, unresolved_metrics
+    )
+
+    assert resolved == {}
+    assert "numerator 'ad_clicks' not computed" in unresolved["ad_click_rate"]
+    assert "cumulative_window" in unresolved["ad_click_rate"]
+
+
+def test_a_ratio_whose_denominator_did_not_resolve_is_reported_unresolved():
+    plan = plan_with_ratios(
+        {"ad_click_rate": aggregation_ratio("ad_click_rate", "ad_clicks", "search_count")}
+    )
+    resolved_metrics = {"ad_clicks": ratio_metric("ad_clicks", "newtab")}
+
+    resolved, unresolved = metrics.split_resolved_ratios(plan, resolved_metrics, {})
+
+    assert resolved == {}
+    assert "denominator 'search_count' not computed" in unresolved["ad_click_rate"]
+    assert "no nimbus/ definition" in unresolved["ad_click_rate"]
+
+
+def test_a_ratio_whose_components_read_different_sources_is_unresolved():
+    plan = plan_with_ratios(
+        {"ad_click_rate": aggregation_ratio("ad_click_rate", "ad_clicks", "search_count")}
+    )
+    resolved_metrics = {
+        "ad_clicks": ratio_metric("ad_clicks", "newtab"),
+        "search_count": ratio_metric("search_count", "clients_daily"),
+    }
+
+    resolved, unresolved = metrics.split_resolved_ratios(plan, resolved_metrics, {})
+
+    assert resolved == {}
+    assert "must read the same metric-hub source" in unresolved["ad_click_rate"]
+
+
+def test_a_ratio_whose_components_declare_different_windows_is_unresolved():
+    plan = plan_with_ratios(
+        {"ad_click_rate": aggregation_ratio("ad_click_rate", "ad_clicks", "search_count")}
+    )
+    resolved_metrics = {
+        "ad_clicks": metrics.Metric(
+            name="ad_clicks",
+            source="newtab",
+            reducer=REDUCER,
+            window_rules=(metrics.CUMULATIVE_WEEKLY,),
+        ),
+        "search_count": metrics.Metric(
+            name="search_count",
+            source="newtab",
+            reducer=REDUCER,
+            window_rules=(metrics.DISJOINT_WEEKLY,),
+        ),
+    }
+
+    resolved, unresolved = metrics.split_resolved_ratios(plan, resolved_metrics, {})
+
+    assert resolved == {}
+    assert "declare different windows" in unresolved["ad_click_rate"]
+
+
+def test_a_ratio_with_windows_declared_in_different_orders_still_matches():
+    # The parser's own two components are resolved independently, so nothing guarantees their
+    # window rules list the same families in the same order; only the set of rules should matter.
+    plan = plan_with_ratios(
+        {"ad_click_rate": aggregation_ratio("ad_click_rate", "ad_clicks", "search_count")}
+    )
+    resolved_metrics = {
+        "ad_clicks": metrics.Metric(
+            name="ad_clicks",
+            source="newtab",
+            reducer=REDUCER,
+            window_rules=(metrics.CUMULATIVE_WEEKLY, metrics.DISJOINT_WEEKLY),
+        ),
+        "search_count": metrics.Metric(
+            name="search_count",
+            source="newtab",
+            reducer=REDUCER,
+            window_rules=(metrics.DISJOINT_WEEKLY, metrics.CUMULATIVE_WEEKLY),
+        ),
+    }
+
+    resolved, unresolved = metrics.split_resolved_ratios(plan, resolved_metrics, {})
+
+    assert unresolved == {}
+    assert resolved["ad_click_rate"].window_rules == (
+        metrics.CUMULATIVE_WEEKLY,
+        metrics.DISJOINT_WEEKLY,
+    )
+
+
+def ratio_experiment_with(metric_names, display=None):
+    return Experiment(
+        slug="a-slug",
+        start_date=None,
+        end_date=None,
+        reference_branch="control",
+        treatment_branches=("treatment",),
+        unit=units.resolve("firefox_desktop", "normandy_id"),
+        metrics={
+            name: (display or {}).get(
+                name, MetricDisplay(friendly_name=None, description=None, bigger_is_better=None)
+            )
+            for name in metric_names
+        },
+    )
+
+
+def test_ratios_for_experiment_keeps_only_the_names_it_asked_for():
+    resolved_ratios = {
+        "ad_click_rate": metrics.Ratio(
+            name="ad_click_rate",
+            numerator=ratio_metric("ad_clicks", "newtab"),
+            denominator=ratio_metric("search_count", "newtab"),
+            window_rules=(metrics.CUMULATIVE_WEEKLY,),
+        )
+    }
+    experiment = ratio_experiment_with(["ad_click_rate"])
+
+    chosen, problems = metrics.ratios_for_experiment(experiment, resolved_ratios, {})
+
+    assert [ratio.name for ratio in chosen] == ["ad_click_rate"]
+    assert problems == []
+
+
+def test_ratios_for_experiment_attaches_its_own_display_text():
+    resolved_ratios = {
+        "ad_click_rate": metrics.Ratio(
+            name="ad_click_rate",
+            numerator=ratio_metric("ad_clicks", "newtab"),
+            denominator=ratio_metric("search_count", "newtab"),
+            window_rules=(metrics.CUMULATIVE_WEEKLY,),
+        )
+    }
+    display = MetricDisplay(
+        friendly_name="Ad click rate", description="Clicks per search.", bigger_is_better=True
+    )
+    experiment = ratio_experiment_with(
+        ["ad_click_rate"], display={"ad_click_rate": display}
+    )
+
+    chosen, _ = metrics.ratios_for_experiment(experiment, resolved_ratios, {})
+
+    assert chosen[0].friendly_name == "Ad click rate"
+    assert chosen[0].description == "Clicks per search."
+
+
+def test_ratios_for_experiment_reports_a_name_it_asked_for_that_did_not_resolve_as_a_ratio():
+    experiment = ratio_experiment_with(["ad_click_rate"])
+
+    chosen, problems = metrics.ratios_for_experiment(
+        experiment,
+        {},
+        {"ad_click_rate": "denominator 'search_count' not computed: ..."},
+    )
+
+    assert chosen == []
+    assert len(problems) == 1
+    assert problems[0].name == "ad_click_rate"
+
+
+def test_ratios_for_experiment_silently_skips_an_ordinary_metric_name():
+    # A plain metric name is reported, if at all, by metrics_for_experiment; ratios_for_experiment
+    # must not report it a second time just because it is not a ratio.
+    experiment = ratio_experiment_with(["active_hours"])
+
+    chosen, problems = metrics.ratios_for_experiment(experiment, {}, {})
+
+    assert chosen == []
+    assert problems == []

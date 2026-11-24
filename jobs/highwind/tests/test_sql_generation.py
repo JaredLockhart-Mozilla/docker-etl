@@ -488,7 +488,7 @@ def test_a_run_is_split_into_one_query_per_source_and_unit():
         "retained_dau": named("retained_dau"),
     }
     sources = {"clients_daily": CLIENTS_DAILY_SOURCE, "active_users": ACTIVE_USERS_SOURCE}
-    queries = sql_generation.build_queries(run, resolved_metrics, sources, "a.cohort_table")
+    queries = sql_generation.build_queries(run, resolved_metrics, {}, sources, "a.cohort_table")
 
     assert set(queries) == {
         "clients_daily/client_id",
@@ -508,6 +508,7 @@ def test_a_run_whose_experiments_all_randomize_alike_stays_one_query_per_source(
     queries = sql_generation.build_queries(
         run,
         {"active_hours": named("active_hours")},
+        {},
         {"clients_daily": CLIENTS_DAILY_SOURCE},
         "a.cohort_table",
     )
@@ -530,7 +531,7 @@ def test_a_source_used_only_at_one_unit_builds_no_query_for_the_other():
     }
     sources = {"clients_daily": CLIENTS_DAILY_SOURCE, "active_users": ACTIVE_USERS_SOURCE}
 
-    queries = sql_generation.build_queries(run, resolved_metrics, sources, "a.cohort_table")
+    queries = sql_generation.build_queries(run, resolved_metrics, {}, sources, "a.cohort_table")
 
     assert set(queries) == {"active_users/profile_group_id", "clients_daily/client_id"}
 
@@ -547,7 +548,7 @@ def test_each_units_query_carries_only_its_own_experiments_metrics():
     resolved_metrics = {"active_hours": named("active_hours"), "retained": named("retained")}
     sources = {"clients_daily": CLIENTS_DAILY_SOURCE}
 
-    queries = sql_generation.build_queries(run, resolved_metrics, sources, "a.cohort_table")
+    queries = sql_generation.build_queries(run, resolved_metrics, {}, sources, "a.cohort_table")
 
     assert "retained__raw" not in queries["clients_daily/profile_group_id"]
     assert "retained__raw" in queries["clients_daily/client_id"]
@@ -614,6 +615,7 @@ def test_a_source_selected_by_the_runs_earliest_experiment_keeps_the_runs_own_bo
     queries = sql_generation.build_queries(
         run,
         {"active_hours": named("active_hours")},
+        {},
         {"clients_daily": CLIENTS_DAILY_SOURCE},
         "a.cohort_table",
     )
@@ -643,7 +645,7 @@ def test_a_source_selected_only_by_a_recent_experiment_is_bounded_by_its_own_sta
     }
     sources = {"clients_daily": CLIENTS_DAILY_SOURCE, "active_users": ACTIVE_USERS_SOURCE}
 
-    queries = sql_generation.build_queries(run, resolved_metrics, sources, "a.cohort_table")
+    queries = sql_generation.build_queries(run, resolved_metrics, {}, sources, "a.cohort_table")
 
     old_bound = AS_OF - datetime.timedelta(days=200 + COVARIATE_DAYS)
     new_bound = AS_OF - datetime.timedelta(days=10 + COVARIATE_DAYS)
@@ -672,7 +674,7 @@ def test_an_experiment_not_selecting_a_source_is_excluded_from_its_query():
     }
     sources = {"clients_daily": CLIENTS_DAILY_SOURCE, "active_users": ACTIVE_USERS_SOURCE}
 
-    queries = sql_generation.build_queries(run, resolved_metrics, sources, "a.cohort_table")
+    queries = sql_generation.build_queries(run, resolved_metrics, {}, sources, "a.cohort_table")
 
     assert "'old-slug'" not in queries["active_users/client_id"]
     assert "'new-slug'" not in queries["clients_daily/client_id"]
@@ -912,6 +914,7 @@ def test_build_source_query_assembles_every_stage_for_a_multi_metric_source():
         run,
         "clients_daily",
         [quantile_metric(0.995), named("retained")],
+        [],
         CLIENTS_DAILY_SOURCE,
         "a.cohort_table",
         CLIENT_UNIT,
@@ -943,7 +946,7 @@ def test_build_source_query_adds_no_quantile_cte_when_every_metric_is_off():
     run = run_of({"a-slug": disjoint_windows(1)})
 
     sql = sql_generation.build_source_query(
-        run, "active_users", [named("retained_dau")], ACTIVE_USERS_SOURCE, "a.cohort_table",
+        run, "active_users", [named("retained_dau")], [], ACTIVE_USERS_SOURCE, "a.cohort_table",
         CLIENT_UNIT,
     )
 
@@ -1309,8 +1312,8 @@ def test_build_source_query_adds_no_unit_segments_cte_when_the_run_is_dark():
     run = run_of({"a-slug": cumulative_windows(2)})
 
     sql = sql_generation.build_source_query(
-        run, "clients_daily", [named("active_hours")], CLIENTS_DAILY_SOURCE, "a.cohort_table",
-        CLIENT_UNIT,
+        run, "clients_daily", [named("active_hours")], [], CLIENTS_DAILY_SOURCE,
+        "a.cohort_table", CLIENT_UNIT,
     )
 
     assert "unit_segments AS (" not in sql
@@ -1322,8 +1325,8 @@ def test_build_source_query_adds_the_unit_segments_cte_when_the_run_resolved_one
     )
 
     sql = sql_generation.build_source_query(
-        run, "clients_daily", [named("active_hours")], CLIENTS_DAILY_SOURCE, "a.cohort_table",
-        CLIENT_UNIT, "a.unit_segments_table",
+        run, "clients_daily", [named("active_hours")], [], CLIENTS_DAILY_SOURCE,
+        "a.cohort_table", CLIENT_UNIT, "a.unit_segments_table",
     )
 
     assert "unit_segments AS (" in sql
@@ -1346,3 +1349,155 @@ def test_a_run_needs_segments_only_when_one_of_its_own_experiments_resolved_one(
 
     assert dark.needs_segments is False
     assert lit.needs_segments is True
+
+
+def ratio_of(name, numerator, denominator):
+    return metrics.Ratio(
+        name=name, numerator=numerator, denominator=denominator,
+        window_rules=numerator.window_rules,
+    )
+
+
+def test_ratio_rollup_select_builds_one_struct_per_window_rule():
+    numerator = metric_with_name("ad_clicks")
+    denominator = metric_with_name("search_count")
+    ratio = ratio_of("ad_click_rate", numerator, denominator)
+    run = run_of({"a-slug": cumulative_windows(1)})
+
+    sql = sql_generation.ratio_rollup_select([ratio], run)
+
+    assert (
+        "STRUCT('ad_click_rate' AS metric, cumulative_window AS window_label, "
+        "ad_clicks__cumulative AS m_post, search_count__cumulative AS d_post, "
+        "ad_clicks__pre AS m_pre, search_count__pre AS d_pre)" in sql
+    )
+    assert "SUM(metric_row.m_post) AS sum_m" in sql
+    assert "SUM(CAST(metric_row.m_post AS FLOAT64) * metric_row.d_post) AS sum_m_d" in sql
+    assert "SUM(CAST(metric_row.m_pre AS FLOAT64) * metric_row.d_pre) AS pre_sum_m_d" in sql
+    assert "SUM(CAST(metric_row.m_post AS FLOAT64) * metric_row.m_pre) AS sum_m_post_m_pre" in sql
+    assert "SUM(CAST(metric_row.d_post AS FLOAT64) * metric_row.d_pre) AS sum_d_post_d_pre" in sql
+    assert "SUM(CAST(metric_row.m_post AS FLOAT64) * metric_row.d_pre) AS sum_m_post_d_pre" in sql
+    assert "SUM(CAST(metric_row.m_pre AS FLOAT64) * metric_row.d_post) AS sum_m_pre_d_post" in sql
+    assert sql.rstrip().endswith(
+        "GROUP BY slug, branch, segment, metric_row.window_label, metric_row.metric"
+    )
+
+
+def test_source_rollup_is_byte_identical_to_rollup_select_without_a_ratio():
+    run = run_of({"a-slug": cumulative_windows(1)})
+    metric = named("active_hours")
+
+    assert sql_generation.source_rollup([metric], [], run) == sql_generation.rollup_select(
+        [metric], run
+    )
+
+
+def test_source_rollup_unions_the_ratio_rollup_in_when_one_is_present():
+    numerator = metric_with_name("ad_clicks")
+    denominator = metric_with_name("search_count")
+    ratio = ratio_of("ad_click_rate", numerator, denominator)
+    run = run_of({"a-slug": cumulative_windows(1)})
+
+    sql = sql_generation.source_rollup([numerator, denominator], [ratio], run)
+
+    assert "UNION ALL" in sql
+    assert "STRUCT('ad_clicks' AS metric" in sql
+    assert "STRUCT('ad_click_rate' AS metric" in sql
+    assert "'off' AS winsorize_mode, CAST(NULL AS FLOAT64) AS post_winsorize_threshold" in sql
+    assert "CAST(NULL AS FLOAT64) AS sum_m" in sql
+    assert "ratio_rollup.sum_m" in sql
+
+
+def test_build_source_query_with_a_ratio_carries_both_rollups():
+    numerator = metric_with_name("ad_clicks")
+    denominator = metric_with_name("search_count")
+    ratio = ratio_of("ad_click_rate", numerator, denominator)
+    run = run_of({"a-slug": cumulative_windows(1)})
+
+    sql = sql_generation.build_source_query(
+        run, "clients_daily", [numerator, denominator], [ratio], CLIENTS_DAILY_SOURCE,
+        "a.cohort_table", CLIENT_UNIT,
+    )
+
+    assert "ad_clicks__raw" in sql
+    assert "search_count__raw" in sql
+    assert "STRUCT('ad_click_rate' AS metric" in sql
+    assert "UNION ALL" in sql
+
+
+def test_build_queries_adds_a_ratios_own_components_even_when_not_independently_requested():
+    # The experiment asks only for the ratio by name; its numerator and denominator must still be
+    # computed as ordinary per-unit window values for the ratio rollup to read.
+    run = run_of(
+        {"a-slug": cumulative_windows(1)}, metric_names_by_slug={"a-slug": ("ad_click_rate",)}
+    )
+    numerator = metric_with_name("ad_clicks")
+    denominator = metric_with_name("search_count")
+    resolved_metrics = {"ad_clicks": numerator, "search_count": denominator}
+    resolved_ratios = {"ad_click_rate": ratio_of("ad_click_rate", numerator, denominator)}
+    sources = {"clients_daily": CLIENTS_DAILY_SOURCE}
+
+    queries = sql_generation.build_queries(
+        run, resolved_metrics, resolved_ratios, sources, "a.cohort_table"
+    )
+
+    sql = queries["clients_daily/client_id"]
+    assert "ad_clicks__raw" in sql
+    assert "search_count__raw" in sql
+    assert "STRUCT('ad_click_rate' AS metric" in sql
+    # The components are also rolled up as ordinary metrics (`build_queries` adds them to this
+    # source's own metric set so their per-unit window values exist for the ratio rollup to read),
+    # even though no experiment asked for either by name; nothing downstream ever reads those
+    # cells back out, since the experiment's own metric list never names them.
+    assert "STRUCT('ad_clicks' AS metric" in sql
+
+
+def test_build_queries_scopes_a_ratios_components_to_its_own_analysis_unit():
+    # A ratio requested by one unit's experiment must not leak its numerator/denominator into a
+    # different unit's query for the same source, the ratio analogue of
+    # test_each_units_query_carries_only_its_own_experiments_metrics.
+    run = run_of(
+        {"grouped": cumulative_windows(1), "by-client": cumulative_windows(1)},
+        units_by_slug={"grouped": GROUP_UNIT},
+        metric_names_by_slug={
+            "grouped": ("active_hours",),
+            "by-client": ("ad_click_rate",),
+        },
+    )
+    numerator = metric_with_name("ad_clicks")
+    denominator = metric_with_name("search_count")
+    resolved_metrics = {
+        "active_hours": named("active_hours"),
+        "ad_clicks": numerator,
+        "search_count": denominator,
+    }
+    resolved_ratios = {"ad_click_rate": ratio_of("ad_click_rate", numerator, denominator)}
+    sources = {"clients_daily": CLIENTS_DAILY_SOURCE}
+
+    queries = sql_generation.build_queries(
+        run, resolved_metrics, resolved_ratios, sources, "a.cohort_table"
+    )
+
+    assert set(queries) == {"clients_daily/profile_group_id", "clients_daily/client_id"}
+    grouped_sql = queries["clients_daily/profile_group_id"]
+    by_client_sql = queries["clients_daily/client_id"]
+    assert "STRUCT('ad_click_rate' AS metric" not in grouped_sql
+    assert "ad_clicks__raw" not in grouped_sql
+    assert "search_count__raw" not in grouped_sql
+    assert "STRUCT('ad_click_rate' AS metric" in by_client_sql
+    assert "ad_clicks__raw" in by_client_sql
+    assert "search_count__raw" in by_client_sql
+
+
+def test_build_queries_without_any_ratio_is_unaffected_by_the_new_parameter():
+    run = run_of(
+        {"a-slug": cumulative_windows(2)}, metric_names_by_slug={"a-slug": ("active_hours",)}
+    )
+    resolved_metrics = {"active_hours": named("active_hours")}
+    sources = {"clients_daily": CLIENTS_DAILY_SOURCE}
+
+    with_ratios_arg = sql_generation.build_queries(
+        run, resolved_metrics, {}, sources, "a.cohort_table"
+    )
+
+    assert "UNION ALL" not in with_ratios_arg["clients_daily/client_id"]
