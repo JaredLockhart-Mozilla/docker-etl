@@ -21,6 +21,7 @@ whole run (see `sql_generation.bucket_length`).
 
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urljoin
 
 from metric_config_parser.aggregation_plan import aggregation_plan
 from metric_config_parser.config import ConfigCollection
@@ -134,11 +135,16 @@ class UnresolvedMetric:
 def load_metric_hub():
     """Load metric-hub's own `nimbus/` definitions, once per run.
 
-    A fresh clone of `mozilla/metric-hub` every call (see metric-config-parser's
-    `ConfigCollection.from_github_repo`), so the caller does this once for the whole run rather than
-    once per experiment.
+    A nimbus metric can declare a data source that only exists in a Jetstream outcome (metric-hub's
+    `jetstream/outcomes/<app>/<outcome>.toml`), so this loads metric-hub's root and its `jetstream/`
+    subtree together. `ConfigCollection.from_github_repos` clones each one with validation deferred,
+    merges them in order, and validates nimbus definitions once on the merge, rather than on each
+    half on its own: a nimbus config whose only unresolved reference is a Jetstream-only data source
+    would otherwise be dropped by the root's own validation before the merge ever supplies it. The
+    caller does this once for the whole run rather than once per experiment.
     """
-    return ConfigCollection.from_github_repo()
+    jetstream_url = urljoin(f"{ConfigCollection.repo_url}/", "tree/main/jetstream/")
+    return ConfigCollection.from_github_repos([ConfigCollection.repo_url, jetstream_url])
 
 
 def build_aggregation_plan(configs, metric_names):

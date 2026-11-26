@@ -1,10 +1,17 @@
 """Resolving a run's metric names against metric-hub's aggregation plan."""
 
 import types
+from urllib.parse import urljoin
 
 import pytest
+from git import Repo
 from metric_config_parser.aggregation import BucketedAggregation, Combine
-from metric_config_parser.aggregation_plan import AggregationMetric, AggregationPlan
+from metric_config_parser.aggregation_plan import (
+    AggregationMetric,
+    AggregationPlan,
+    aggregation_plan,
+)
+from metric_config_parser.config import ConfigCollection
 
 from highwind import metrics, sql_generation
 from highwind.discovery import Experiment, MetricDisplay
@@ -441,3 +448,107 @@ def test_a_yes_no_metric_is_never_clipped_even_with_a_threshold_set():
     setting = metrics.winsorize_mode(metric_with(is_yes_no=True, winsorize_threshold=500))
 
     assert setting == metrics.Winsorize(metrics.WinsorizeMode.OFF)
+
+
+def _commit_all(repo_path):
+    repo = Repo.init(repo_path)
+    config_writer = repo.config_writer()
+    config_writer.set_value("user", "name", "test")
+    config_writer.set_value("user", "email", "test@example.com")
+    config_writer.set_value("commit", "gpgsign", "false")
+    config_writer.release()
+    repo.git.add(".")
+    repo.git.commit("-m", "commit")
+    return repo
+
+
+def test_load_metric_hub_loads_the_root_and_the_jetstream_subtree(monkeypatch):
+    calls = []
+
+    def fake_from_github_repo(
+        repo_url=None,
+        is_private=False,
+        path=None,
+        depth=None,
+        validate_nimbus=True,
+        strict_nimbus=False,
+    ):
+        calls.append((repo_url, path, validate_nimbus))
+        return ConfigCollection()
+
+    monkeypatch.setattr(metrics.ConfigCollection, "from_github_repo", fake_from_github_repo)
+
+    metrics.load_metric_hub()
+
+    jetstream_url = urljoin(f"{ConfigCollection.repo_url}/", "tree/main/jetstream/")
+    assert calls == [
+        (ConfigCollection.repo_url, None, False),
+        (jetstream_url, None, False),
+    ]
+
+
+def test_load_metric_hub_resolves_a_nimbus_metric_against_a_jetstream_outcome_data_source(
+    tmp_path, monkeypatch
+):
+    nimbus_definitions_dir = tmp_path / "nimbus" / "definitions"
+    nimbus_definitions_dir.mkdir(parents=True)
+    (nimbus_definitions_dir / "firefox_desktop.toml").write_text(
+        "[metrics.active_hours]\n"
+        'data_source = "clients_daily"\n'
+        'aggregation = "sum"\n'
+        'column = "active_hours_sum"\n\n'
+        "[metrics.backup_started]\n"
+        'data_source = "backup_events_v1"\n'
+        'aggregation = "any"\n\n'
+        "[[metrics.backup_started.where]]\n"
+        'column = "event_name"\n'
+        'op = "="\n'
+        'value = "backup_start"\n'
+    )
+
+    definitions_dir = tmp_path / "definitions"
+    definitions_dir.mkdir(parents=True)
+    (definitions_dir / "firefox_desktop.toml").write_text(
+        "[data_sources.clients_daily]\n"
+        'from_expression = "mozdata.telemetry.clients_daily"\n'
+    )
+
+    jetstream_outcomes_dir = tmp_path / "jetstream" / "outcomes" / "firefox_desktop"
+    jetstream_outcomes_dir.mkdir(parents=True)
+    (jetstream_outcomes_dir / "firefox_backup.toml").write_text(
+        'friendly_name = "Firefox Backup"\n'
+        'description = "Firefox Backup"\n\n'
+        "[data_sources.backup_events_v1]\n"
+        'from_expression = "mozdata.firefox_desktop.backup_events_v1"\n'
+    )
+
+    repo = _commit_all(tmp_path)
+    jetstream_url = urljoin(f"{ConfigCollection.repo_url}/", "tree/main/jetstream/")
+
+    def fake_from_github_repo(
+        repo_url=None,
+        is_private=False,
+        path=None,
+        depth=None,
+        validate_nimbus=True,
+        strict_nimbus=False,
+    ):
+        return ConfigCollection.from_local_repo(
+            repo=repo,
+            path="jetstream" if repo_url == jetstream_url else None,
+            is_private=is_private,
+            main_branch=repo.active_branch.name,
+            validate_nimbus=validate_nimbus,
+            strict_nimbus=strict_nimbus,
+        )
+
+    monkeypatch.setattr(metrics.ConfigCollection, "from_github_repo", fake_from_github_repo)
+
+    collection = metrics.load_metric_hub()
+    plan = aggregation_plan(collection, "firefox_desktop", ["active_hours", "backup_started"])
+
+    assert plan.missing == []
+    assert (
+        plan.sources["backup_events_v1"].from_expression
+        == "mozdata.firefox_desktop.backup_events_v1"
+    )
